@@ -1,25 +1,27 @@
 {
   "expo": {
-    "name": "gaussian_scanner",
-    "slug": "gaussian_scanner",
+    "name": "Gaussian Scanner",
+    "slug": "gaussian-scanner",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
-    "userInterfaceStyle": "light",
+    "scheme": "gaussianscanner",
+    "userInterfaceStyle": "dark",
     "ios": {
-      "supportsTablet": true
+      "supportsTablet": false,
+      "bundleIdentifier": "com.filipor.gaussianscanner",
+      "infoPlist": {
+        "NSCameraUsageDescription": "Aplikacja używa kamery i ARKit do skanowania pomieszczeń i zbierania zdjęć do treningu gaussian splatów.",
+        "UIRequiredDeviceCapabilities": ["arkit"]
+      }
     },
-    "android": {
-      "adaptiveIcon": {
-        "backgroundColor": "#E6F4FE",
-        "foregroundImage": "./assets/android-icon-foreground.png",
-        "backgroundImage": "./assets/android-icon-background.png",
-        "monochromeImage": "./assets/android-icon-monochrome.png"
-      },
-      "predictiveBackGestureEnabled": false
-    },
-    "web": {
-      "favicon": "./assets/favicon.png"
+    "plugins": [
+      "expo-router",
+      "expo-sharing",
+      "expo-status-bar"
+    ],
+    "experiments": {
+      "typedRoutes": true
     }
   }
 }
