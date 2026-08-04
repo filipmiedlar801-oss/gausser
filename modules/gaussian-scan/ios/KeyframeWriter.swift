@@ -12,12 +12,12 @@ final class KeyframeWriter {
   private let writeQueue = DispatchQueue(label: "gaussianscan.keyframes", qos: .utility)
 
   // Selection thresholds — must differ from every existing pose, not only the last.
-  // Pose spacing: 0.14 m is ~2× denser than the old 0.28 m gate and still above
-  // Apple Spatial Capture’s ~0.08 m default — enough overlap for room-scale 3DGS
-  // without flooding near-duplicates. Blur/speed gates stay strict so density
-  // does not come from smear.
+  // Pose spacing stays denser at 0.14 m, and a 12° pivot gate accepts useful
+  // corner / around-object parallax closer to mobile capture norms while blur,
+  // speed, and high-res sharpness gates stay strict so density does not come
+  // from smear.
   private let minTranslation: Float = 0.14      // m
-  private let minRotationDeg: Float = 18
+  private let minRotationDeg: Float = 12
   private let minSharpness01: Float = 0.38
   private let minSharpnessRaw: Float = 45
   private let maxMotionBlurRisk: Float = 0.38
