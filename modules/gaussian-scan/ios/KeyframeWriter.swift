@@ -14,8 +14,11 @@ final class KeyframeWriter {
   // Selection thresholds — must differ from every existing pose, not only the last.
   // Pose spacing: 0.14 m is ~2× denser than the old 0.28 m gate and still above
   // Apple Spatial Capture’s ~0.08 m default — enough overlap for room-scale 3DGS
-  // without flooding near-duplicates. Blur/speed gates stay strict so density
-  // does not come from smear.
+  // without flooding near-duplicates. Capture interval: 0.6 s (~1.7 fps ceiling)
+  // matches that denser baseline on a slow walk (~0.2–0.25 m/s) instead of the
+  // old 0.9 s throttle discarding already-sharp, pose-novel frames. Blur/speed
+  // gates stay strict so density does not come from smear; captureInFlight still
+  // serializes high-res stills.
   private let minTranslation: Float = 0.14      // m
   private let minRotationDeg: Float = 18
   private let minSharpness01: Float = 0.38
@@ -23,7 +26,7 @@ final class KeyframeWriter {
   private let maxMotionBlurRisk: Float = 0.38
   private let maxSpeed: Float = 0.45            // m/s
   private let maxAngularSpeed: Float = 28       // deg/s
-  private let minCaptureInterval: TimeInterval = 0.9
+  private let minCaptureInterval: TimeInterval = 0.6
 
   private let sharpnessProbe = FrameQualityAnalyzer()
   private var keyframeTransforms: [simd_float4x4] = []
