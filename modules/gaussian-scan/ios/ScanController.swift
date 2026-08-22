@@ -36,6 +36,8 @@ final class ScanController: NSObject, ARSessionDelegate {
 
   private var waypoint: simd_float3?
   private var waypointNode: SCNNode?
+  /// Camera within this distance of a coverage hole → denser keyframe capture interval.
+  private let coverageHoleBoostDistance: Float = 1.25
 
   init(view: ScanView) {
     self.view = view
@@ -388,7 +390,15 @@ final class ScanController: NSObject, ARSessionDelegate {
         cachedHoles = engine.holes(maxCount: 8)
         emitCoverage()
       }
-      keyframes?.consider(frame: frame, metrics: metrics)
+      let camPos = simd_float3(
+        frame.camera.transform.columns.3.x,
+        frame.camera.transform.columns.3.y,
+        frame.camera.transform.columns.3.z
+      )
+      let nearHole = cachedHoles.contains { hole in
+        simd_length(hole.position - camPos) <= coverageHoleBoostDistance
+      }
+      keyframes?.consider(frame: frame, metrics: metrics, nearCoverageHole: nearHole)
     }
 
     // Waypoint bearing relative to the camera

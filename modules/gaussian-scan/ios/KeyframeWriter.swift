@@ -14,8 +14,9 @@ final class KeyframeWriter {
   // Selection thresholds — must differ from every existing pose, not only the last.
   // Pose spacing: 0.14 m is ~2× denser than the old 0.28 m gate and still above
   // Apple Spatial Capture’s ~0.08 m default — enough overlap for room-scale 3DGS
-  // without flooding near-duplicates. Blur/speed gates stay strict so density
-  // does not come from smear.
+  // without flooding near-duplicates. Near coverage holes the interval drops to
+  // 0.55 s so sharp, pose-novel frames are not discarded while filling gaps;
+  // blur/speed gates stay strict and coverage alone never fires captures.
   private let minTranslation: Float = 0.14      // m
   private let minRotationDeg: Float = 18
   private let minSharpness01: Float = 0.38
@@ -24,6 +25,7 @@ final class KeyframeWriter {
   private let maxSpeed: Float = 0.45            // m/s
   private let maxAngularSpeed: Float = 28       // deg/s
   private let minCaptureInterval: TimeInterval = 0.9
+  private let minCaptureIntervalNearHole: TimeInterval = 0.55
 
   private let sharpnessProbe = FrameQualityAnalyzer()
   private var keyframeTransforms: [simd_float4x4] = []
@@ -77,7 +79,10 @@ final class KeyframeWriter {
   }
 
   /// Called on the analysis queue for every analyzed frame.
-  func consider(frame: ARFrame, metrics: FrameMetrics) {
+  /// - Parameter nearCoverageHole: when true (camera near a coverage gap), use a
+  ///   shorter capture interval so sparse regions accumulate more sharp views.
+  ///   Does not bypass blur/speed/sharpness/pose gates.
+  func consider(frame: ARFrame, metrics: FrameMetrics, nearCoverageHole: Bool = false) {
     guard metrics.trackingState == "normal" else { return }
     guard metrics.motionBlurRisk <= maxMotionBlurRisk else { return }
     guard metrics.speed <= maxSpeed, metrics.angularSpeed <= maxAngularSpeed else { return }
@@ -85,7 +90,8 @@ final class KeyframeWriter {
     guard !captureInFlight else { return }
 
     let now = CACurrentMediaTime()
-    guard now - lastCaptureTime >= minCaptureInterval else { return }
+    let interval = nearCoverageHole ? minCaptureIntervalNearHole : minCaptureInterval
+    guard now - lastCaptureTime >= interval else { return }
 
     let transform = frame.camera.transform
     if !keyframeTransforms.isEmpty, isTooSimilar(to: transform) {
