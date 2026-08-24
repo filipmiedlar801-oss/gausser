@@ -33,6 +33,9 @@ final class ScanController: NSObject, ARSessionDelegate {
   private weak var captureDevice: AVCaptureDevice?
   /// Keep forcing ultra-wide for a few seconds — ARKit often resets zoom after `run`.
   private var zoomEnforceUntil: TimeInterval = 0
+  /// Sample candidate frames at 15 Hz so brief steady moments during pivots/gap-filling
+  /// walks are less likely to be skipped between analysis ticks.
+  private let analysisInterval: TimeInterval = 1.0 / 15.0
 
   private var waypoint: simd_float3?
   private var waypointNode: SCNNode?
@@ -334,7 +337,7 @@ final class ScanController: NSObject, ARSessionDelegate {
   func session(_ session: ARSession, didUpdate frame: ARFrame) {
     guard mode == .wizard || mode == .scanning else { return }
     let now = frame.timestamp
-    guard !analyzing, now - lastAnalysis >= 0.1 else { return }
+    guard !analyzing, now - lastAnalysis >= analysisInterval else { return }
     analyzing = true
     lastAnalysis = now
 
