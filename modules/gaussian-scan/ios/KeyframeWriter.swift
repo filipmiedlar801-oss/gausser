@@ -29,6 +29,8 @@ final class KeyframeWriter {
   private var keyframeTransforms: [simd_float4x4] = []
   private var lastCaptureTime: TimeInterval = 0
   private var captureInFlight = false
+  /// Preview-frame blur risk for the in-flight high-res capture (used to calibrate the save gate).
+  private var pendingPreviewBlurRisk: Float = 1
   private var entries: [[String: Any]] = []
   private(set) var frameIndex = 0
 
@@ -93,6 +95,7 @@ final class KeyframeWriter {
     }
 
     captureInFlight = true
+    pendingPreviewBlurRisk = metrics.motionBlurRisk
     lastCaptureTime = now
     keyframeTransforms.append(transform)
 
@@ -104,9 +107,9 @@ final class KeyframeWriter {
       session.captureHighResolutionFrame { [weak self] highResFrame, _ in
         guard let self = self else { return }
         if let hf = highResFrame {
-          self.saveIfSharp(pixelBuffer: hf.capturedImage, camera: hf.camera, timestamp: hf.timestamp, index: index, highRes: true)
+          self.saveIfSharp(pixelBuffer: hf.capturedImage, camera: hf.camera, timestamp: hf.timestamp, index: index, highRes: true, previewBlurRisk: self.pendingPreviewBlurRisk)
         } else if let current = session.currentFrame {
-          self.saveIfSharp(pixelBuffer: current.capturedImage, camera: current.camera, timestamp: current.timestamp, index: index, highRes: false)
+          self.saveIfSharp(pixelBuffer: current.capturedImage, camera: current.camera, timestamp: current.timestamp, index: index, highRes: false, previewBlurRisk: self.pendingPreviewBlurRisk)
         } else {
           self.abortCapture()
         }
@@ -121,8 +124,19 @@ final class KeyframeWriter {
     return false
   }
 
+  /// High-res buffers score differently from the 384 px preview probe; when the preview
+  /// frame was steady (low blur risk) we align the save gate with the preview relaxed path
+  /// so sharp stills are not dropped after `captureHighResolutionFrame` completes.
+  private func passesHighResSharpnessGate(sharpness01: Float, raw: Float, previewBlurRisk: Float) -> Bool {
+    if sharpness01 >= minSharpness01 * 0.85 && raw >= minSharpnessRaw * 0.85 { return true }
+    if sharpness01 >= 0.30 && raw >= 28 { return true }
+    if previewBlurRisk <= 0.22 && sharpness01 >= 0.28 && raw >= 24 { return true }
+    return false
+  }
+
   private func abortCapture() {
     captureInFlight = false
+    pendingPreviewBlurRisk = 1
     if !keyframeTransforms.isEmpty {
       keyframeTransforms.removeLast()
     }
@@ -130,23 +144,22 @@ final class KeyframeWriter {
   }
 
   /// Final gate: re-measure sharpness on the exact buffer we would write.
-  private func saveIfSharp(pixelBuffer: CVPixelBuffer, camera: ARCamera, timestamp: TimeInterval, index: Int, highRes: Bool) {
+  private func saveIfSharp(pixelBuffer: CVPixelBuffer, camera: ARCamera, timestamp: TimeInterval, index: Int, highRes: Bool, previewBlurRisk: Float) {
     writeQueue.async { [weak self] in
       guard let self = self else { return }
 
       let measured = self.sharpnessProbe.measureSharpness(pixelBuffer: pixelBuffer)
       let raw = measured.laplacian
       let sharpness01 = measured.sharpness01
-      // High-res buffers score differently; use a slightly softer absolute floor.
-      // Motion already passed on the preview frame.
-      let ok = (sharpness01 >= self.minSharpness01 * 0.85 && raw >= self.minSharpnessRaw * 0.85)
-        || (sharpness01 >= 0.30 && raw >= 28)
-      guard ok else {
+      guard self.passesHighResSharpnessGate(sharpness01: sharpness01, raw: raw, previewBlurRisk: previewBlurRisk) else {
         self.abortCapture()
         return
       }
 
-      defer { self.captureInFlight = false }
+      defer {
+        self.captureInFlight = false
+        self.pendingPreviewBlurRisk = 1
+      }
 
       // Rotate to portrait so exported photos match what the user saw.
       let image = CIImage(cvPixelBuffer: pixelBuffer).oriented(.right)
