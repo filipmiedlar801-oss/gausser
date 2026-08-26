@@ -14,9 +14,12 @@ final class KeyframeWriter {
   // Selection thresholds — must differ from every existing pose, not only the last.
   // Pose spacing: 0.14 m is ~2× denser than the old 0.28 m gate and still above
   // Apple Spatial Capture’s ~0.08 m default — enough overlap for room-scale 3DGS
-  // without flooding near-duplicates. Blur/speed gates stay strict so density
-  // does not come from smear.
+  // without flooding near-duplicates. When the camera is near a coverage hole
+  // *and looking toward it*, tighten to 0.10 m so gap-filling walks get extra
+  // multi-view density without densifying mere pass-bys. Blur/speed gates stay
+  // strict; coverage alone never fires a capture.
   private let minTranslation: Float = 0.14      // m
+  private let minTranslationTowardHole: Float = 0.10 // m — looking-toward-hole only
   private let minRotationDeg: Float = 18
   private let minSharpness01: Float = 0.38
   private let minSharpnessRaw: Float = 45
@@ -59,13 +62,13 @@ final class KeyframeWriter {
   var keyframeCount: Int { entries.count }
 
   /// True when `candidate` is too close (pose) to any already-saved keyframe.
-  private func isTooSimilar(to candidate: simd_float4x4) -> Bool {
+  private func isTooSimilar(to candidate: simd_float4x4, minTranslationMeters: Float) -> Bool {
     let camPos = simd_float3(candidate.columns.3.x, candidate.columns.3.y, candidate.columns.3.z)
     let camQuat = simd_quatf(candidate)
     for existing in keyframeTransforms {
       let ep = simd_float3(existing.columns.3.x, existing.columns.3.y, existing.columns.3.z)
       let translation = simd_length(camPos - ep)
-      if translation < minTranslation {
+      if translation < minTranslationMeters {
         let dq = camQuat * simd_quatf(existing).inverse
         let rotationDeg = abs(dq.angle) * 180 / .pi
         if rotationDeg < minRotationDeg {
@@ -77,7 +80,10 @@ final class KeyframeWriter {
   }
 
   /// Called on the analysis queue for every analyzed frame.
-  func consider(frame: ARFrame, metrics: FrameMetrics) {
+  /// - Parameter lookingTowardCoverageHole: when true (near a gap and facing it),
+  ///   use a tighter translation baseline so sparse regions accumulate more sharp
+  ///   views. Does not bypass blur/speed/sharpness/interval gates.
+  func consider(frame: ARFrame, metrics: FrameMetrics, lookingTowardCoverageHole: Bool = false) {
     guard metrics.trackingState == "normal" else { return }
     guard metrics.motionBlurRisk <= maxMotionBlurRisk else { return }
     guard metrics.speed <= maxSpeed, metrics.angularSpeed <= maxAngularSpeed else { return }
@@ -88,7 +94,8 @@ final class KeyframeWriter {
     guard now - lastCaptureTime >= minCaptureInterval else { return }
 
     let transform = frame.camera.transform
-    if !keyframeTransforms.isEmpty, isTooSimilar(to: transform) {
+    let translationGate = lookingTowardCoverageHole ? minTranslationTowardHole : minTranslation
+    if !keyframeTransforms.isEmpty, isTooSimilar(to: transform, minTranslationMeters: translationGate) {
       return
     }
 
