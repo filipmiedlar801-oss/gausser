@@ -93,6 +93,9 @@ final class KeyframeWriter {
     }
 
     captureInFlight = true
+    // Stamp the interval now so concurrent analysis frames cannot start a second
+    // capture while high-res is in flight. `abortCapture` clears this stamp so a
+    // failed high-res/encode does not burn the full minCaptureInterval.
     lastCaptureTime = now
     keyframeTransforms.append(transform)
 
@@ -121,8 +124,14 @@ final class KeyframeWriter {
     return false
   }
 
+  /// Rolls back a reserved pose that never became a saved keyframe.
+  /// Clears `lastCaptureTime` so the next sharp, pose-novel frame can retry
+  /// immediately instead of waiting out a full `minCaptureInterval` (0.9 s)
+  /// after a high-res sharpness miss or missing buffer — common when walking
+  /// slowly through hard-to-cover gaps.
   private func abortCapture() {
     captureInFlight = false
+    lastCaptureTime = 0
     if !keyframeTransforms.isEmpty {
       keyframeTransforms.removeLast()
     }
@@ -158,7 +167,10 @@ final class KeyframeWriter {
           options: [kCGImageDestinationLossyCompressionQuality as CIImageRepresentationOption: 0.92]
         )
       } catch {
-        // Sharpness passed but encode failed — drop reserved pose.
+        // Sharpness passed but encode failed — drop reserved pose and free the
+        // interval. Leave `captureInFlight` to the defer below (same as success)
+        // so a concurrent `consider` cannot start mid-rollback.
+        self.lastCaptureTime = 0
         if !self.keyframeTransforms.isEmpty {
           self.keyframeTransforms.removeLast()
         }
