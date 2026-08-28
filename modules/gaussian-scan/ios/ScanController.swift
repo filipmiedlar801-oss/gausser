@@ -36,6 +36,12 @@ final class ScanController: NSObject, ARSessionDelegate {
 
   private var waypoint: simd_float3?
   private var waypointNode: SCNNode?
+  /// Camera within this distance of a coverage hole *and looking toward it*
+  /// → denser pivot keyframe spacing (gap-fill only, not mere pass-bys).
+  private let coverageHoleBoostDistance: Float = 1.25
+  /// Minimum camera-forward · direction-to-hole for the looking-toward gate
+  /// (~57° half-angle cone toward the gap).
+  private let coverageHoleLookDot: Float = 0.55
 
   init(view: ScanView) {
     self.view = view
@@ -388,7 +394,16 @@ final class ScanController: NSObject, ARSessionDelegate {
         cachedHoles = engine.holes(maxCount: 8)
         emitCoverage()
       }
-      keyframes?.consider(frame: frame, metrics: metrics)
+      let camT = frame.camera.transform
+      let camPos = simd_float3(camT.columns.3.x, camT.columns.3.y, camT.columns.3.z)
+      let forward = -simd_float3(camT.columns.2.x, camT.columns.2.y, camT.columns.2.z)
+      let lookingTowardHole = cachedHoles.contains { hole in
+        let delta = hole.position - camPos
+        let dist = simd_length(delta)
+        guard dist <= coverageHoleBoostDistance, dist > 0.05 else { return false }
+        return simd_dot(simd_normalize(forward), simd_normalize(delta)) >= coverageHoleLookDot
+      }
+      keyframes?.consider(frame: frame, metrics: metrics, lookingTowardCoverageHole: lookingTowardHole)
     }
 
     // Waypoint bearing relative to the camera
