@@ -18,6 +18,12 @@ final class KeyframeWriter {
   // does not come from smear.
   private let minTranslation: Float = 0.14      // m
   private let minRotationDeg: Float = 18
+  /// When looking at ceiling/floor (|lookUp| > threshold), allow denser angular
+  /// sampling — those passes are mostly tilt-in-place with little translation,
+  /// and indoor 3DGS guides call out ceiling/floor as chronically under-covered.
+  /// 12° stays above Apple Spatial Capture’s ~10° default; blur/speed unchanged.
+  private let verticalLookRotationDeg: Float = 12
+  private let verticalLookUpThreshold: Float = 0.35
   private let minSharpness01: Float = 0.38
   private let minSharpnessRaw: Float = 45
   private let maxMotionBlurRisk: Float = 0.38
@@ -58,17 +64,31 @@ final class KeyframeWriter {
 
   var keyframeCount: Int { entries.count }
 
+  /// Camera-forward · worldUp for `candidate` (same signal as GuidanceEngine.lookUp).
+  private func lookUp(of candidate: simd_float4x4) -> Float {
+    let forward = -simd_float3(candidate.columns.2.x, candidate.columns.2.y, candidate.columns.2.z)
+    return forward.y
+  }
+
+  /// Room-scale stays 18°; ceiling/floor tilts use 12° so pivot passes can fire.
+  private func effectiveMinRotationDeg(for candidate: simd_float4x4) -> Float {
+    abs(lookUp(of: candidate)) > verticalLookUpThreshold
+      ? verticalLookRotationDeg
+      : minRotationDeg
+  }
+
   /// True when `candidate` is too close (pose) to any already-saved keyframe.
   private func isTooSimilar(to candidate: simd_float4x4) -> Bool {
     let camPos = simd_float3(candidate.columns.3.x, candidate.columns.3.y, candidate.columns.3.z)
     let camQuat = simd_quatf(candidate)
+    let rotationGate = effectiveMinRotationDeg(for: candidate)
     for existing in keyframeTransforms {
       let ep = simd_float3(existing.columns.3.x, existing.columns.3.y, existing.columns.3.z)
       let translation = simd_length(camPos - ep)
       if translation < minTranslation {
         let dq = camQuat * simd_quatf(existing).inverse
         let rotationDeg = abs(dq.angle) * 180 / .pi
-        if rotationDeg < minRotationDeg {
+        if rotationDeg < rotationGate {
           return true
         }
       }
