@@ -24,6 +24,12 @@ final class KeyframeWriter {
   private let maxSpeed: Float = 0.45            // m/s
   private let maxAngularSpeed: Float = 28       // deg/s
   private let minCaptureInterval: TimeInterval = 0.9
+  /// When looking at ceiling/floor (|lookUp| > threshold), allow a slightly
+  /// denser capture cadence. Those passes are tilt-dominant and chronically
+  /// under-covered; 0.65 s still sits near Polycam-class auto rates and does
+  /// not loosen blur/speed/pose gates. Same lookUp threshold as GuidanceEngine.
+  private let verticalLookCaptureInterval: TimeInterval = 0.65
+  private let verticalLookUpThreshold: Float = 0.35
 
   private let sharpnessProbe = FrameQualityAnalyzer()
   private var keyframeTransforms: [simd_float4x4] = []
@@ -58,6 +64,20 @@ final class KeyframeWriter {
 
   var keyframeCount: Int { entries.count }
 
+  /// Camera-forward · worldUp for `candidate` (same signal as GuidanceEngine.lookUp).
+  private func lookUp(of candidate: simd_float4x4) -> Float {
+    let forward = -simd_float3(candidate.columns.2.x, candidate.columns.2.y, candidate.columns.2.z)
+    return forward.y
+  }
+
+  /// Room-scale stays 0.9 s; ceiling/floor tilts use 0.65 s so sharp angular
+  /// steps are not discarded by the interval wall during dedicated passes.
+  private func effectiveMinCaptureInterval(for candidate: simd_float4x4) -> TimeInterval {
+    abs(lookUp(of: candidate)) > verticalLookUpThreshold
+      ? verticalLookCaptureInterval
+      : minCaptureInterval
+  }
+
   /// True when `candidate` is too close (pose) to any already-saved keyframe.
   private func isTooSimilar(to candidate: simd_float4x4) -> Bool {
     let camPos = simd_float3(candidate.columns.3.x, candidate.columns.3.y, candidate.columns.3.z)
@@ -84,10 +104,10 @@ final class KeyframeWriter {
     guard isSharpEnough(sharpness01: metrics.sharpness01, sharpnessRaw: metrics.sharpness, motionBlurRisk: metrics.motionBlurRisk) else { return }
     guard !captureInFlight else { return }
 
-    let now = CACurrentMediaTime()
-    guard now - lastCaptureTime >= minCaptureInterval else { return }
-
     let transform = frame.camera.transform
+    let now = CACurrentMediaTime()
+    guard now - lastCaptureTime >= effectiveMinCaptureInterval(for: transform) else { return }
+
     if !keyframeTransforms.isEmpty, isTooSimilar(to: transform) {
       return
     }
