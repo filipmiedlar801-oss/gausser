@@ -14,8 +14,10 @@ final class KeyframeWriter {
   // Selection thresholds — must differ from every existing pose, not only the last.
   // Pose spacing: 0.14 m is ~2× denser than the old 0.28 m gate and still above
   // Apple Spatial Capture’s ~0.08 m default — enough overlap for room-scale 3DGS
-  // without flooding near-duplicates. Blur/speed gates stay strict so density
-  // does not come from smear.
+  // without flooding near-duplicates. Far walls (≥ 2.5 m median depth) get a
+  // faster capture cadence: at that range 0.14 m of walk only changes view angle
+  // by ~3°, so once pose novelty passes we should not discard sharp frames on a
+  // 0.9 s wall. Blur/speed gates stay strict so density does not come from smear.
   private let minTranslation: Float = 0.14      // m
   private let minRotationDeg: Float = 18
   private let minSharpness01: Float = 0.38
@@ -24,6 +26,8 @@ final class KeyframeWriter {
   private let maxSpeed: Float = 0.45            // m/s
   private let maxAngularSpeed: Float = 28       // deg/s
   private let minCaptureInterval: TimeInterval = 0.9
+  private let minCaptureIntervalFar: TimeInterval = 0.65 // s — when median depth ≥ farDepthThreshold
+  private let farDepthThreshold: Float = 2.5  // m
 
   private let sharpnessProbe = FrameQualityAnalyzer()
   private var keyframeTransforms: [simd_float4x4] = []
@@ -58,6 +62,49 @@ final class KeyframeWriter {
 
   var keyframeCount: Int { entries.count }
 
+  /// Median depth (m) from LiDAR scene depth in the central view — 0 when unavailable.
+  private func medianSceneDepth(frame: ARFrame) -> Float {
+    guard let depthMap = frame.sceneDepth?.depthMap else { return 0 }
+    CVPixelBufferLockBaseAddress(depthMap, .readOnly)
+    defer { CVPixelBufferUnlockBaseAddress(depthMap, .readOnly) }
+    guard let base = CVPixelBufferGetBaseAddress(depthMap) else { return 0 }
+    let w = CVPixelBufferGetWidth(depthMap)
+    let h = CVPixelBufferGetHeight(depthMap)
+    let row = CVPixelBufferGetBytesPerRow(depthMap) / MemoryLayout<Float32>.size
+    let ptr = base.assumingMemoryBound(to: Float32.self)
+    let u0 = w / 4
+    let u1 = w * 3 / 4
+    let v0 = h / 4
+    let v1 = h * 3 / 4
+    var samples: [Float] = []
+    samples.reserveCapacity(64)
+    var v = v0
+    while v < v1 {
+      var u = u0
+      while u < u1 {
+        let d = ptr[v * row + u]
+        if d.isFinite, d > 0.25, d < 5.5 {
+          samples.append(d)
+        }
+        u += 8
+      }
+      v += 8
+    }
+    guard !samples.isEmpty else { return 0 }
+    samples.sort()
+    return samples[samples.count / 2]
+  }
+
+  /// Capture cadence: faster when looking across the room so far-wall multi-view
+  /// is not throttled by the mid-room 0.9 s interval. Matches the close-range
+  /// depth-adaptive interval (0.65 s) used in orthogonal PRs; mid-band and
+  /// non-LiDAR keep 0.9 s. Pose/blur/speed gates are unchanged.
+  private func effectiveMinCaptureInterval(for frame: ARFrame) -> TimeInterval {
+    let median = medianSceneDepth(frame: frame)
+    guard median >= farDepthThreshold else { return minCaptureInterval }
+    return minCaptureIntervalFar
+  }
+
   /// True when `candidate` is too close (pose) to any already-saved keyframe.
   private func isTooSimilar(to candidate: simd_float4x4) -> Bool {
     let camPos = simd_float3(candidate.columns.3.x, candidate.columns.3.y, candidate.columns.3.z)
@@ -85,7 +132,7 @@ final class KeyframeWriter {
     guard !captureInFlight else { return }
 
     let now = CACurrentMediaTime()
-    guard now - lastCaptureTime >= minCaptureInterval else { return }
+    guard now - lastCaptureTime >= effectiveMinCaptureInterval(for: frame) else { return }
 
     let transform = frame.camera.transform
     if !keyframeTransforms.isEmpty, isTooSimilar(to: transform) {
