@@ -16,6 +16,9 @@ final class KeyframeWriter {
   // Apple Spatial Capture’s ~0.08 m default — enough overlap for room-scale 3DGS
   // without flooding near-duplicates. Blur/speed gates stay strict so density
   // does not come from smear.
+  // Novelty uses an inscribed ellipse in (translation, rotation) space so pure
+  // axis floors stay 0.14 m / 18°, while simultaneous walk+turn (typical room
+  // loops) can pass earlier — see `isTooSimilar`.
   private let minTranslation: Float = 0.14      // m
   private let minRotationDeg: Float = 18
   private let minSharpness01: Float = 0.38
@@ -59,18 +62,29 @@ final class KeyframeWriter {
   var keyframeCount: Int { entries.count }
 
   /// True when `candidate` is too close (pose) to any already-saved keyframe.
+  ///
+  /// Uses an **elliptical** novelty gate in normalized (translation, rotation)
+  /// space instead of the old axis-aligned box (`t < minT && r < minR`):
+  /// `(t / minTranslation)² + (r / minRotationDeg)² < 1` ⇒ too similar.
+  ///
+  /// Pure translation still needs ≥ 0.14 m and pure rotation still needs ≥ 18°
+  /// (ellipse touches the box at the axes). Combined walk+turn — the common
+  /// room-loop motion — becomes novel sooner in the corner (e.g. ~0.12 m +
+  /// ~10°), recovering multi-view density without loosening blur/speed gates
+  /// or lowering either axis floor. Matches combined relative-pose keyframe
+  /// criteria used in mobile SLAM / 3DGS capture tooling.
   private func isTooSimilar(to candidate: simd_float4x4) -> Bool {
     let camPos = simd_float3(candidate.columns.3.x, candidate.columns.3.y, candidate.columns.3.z)
     let camQuat = simd_quatf(candidate)
     for existing in keyframeTransforms {
       let ep = simd_float3(existing.columns.3.x, existing.columns.3.y, existing.columns.3.z)
       let translation = simd_length(camPos - ep)
-      if translation < minTranslation {
-        let dq = camQuat * simd_quatf(existing).inverse
-        let rotationDeg = abs(dq.angle) * 180 / .pi
-        if rotationDeg < minRotationDeg {
-          return true
-        }
+      let dq = camQuat * simd_quatf(existing).inverse
+      let rotationDeg = abs(dq.angle) * 180 / .pi
+      let tn = translation / minTranslation
+      let rn = rotationDeg / minRotationDeg
+      if tn * tn + rn * rn < 1 {
+        return true
       }
     }
     return false
