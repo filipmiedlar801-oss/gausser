@@ -15,8 +15,12 @@ final class KeyframeWriter {
   // Pose spacing: 0.14 m is ~2× denser than the old 0.28 m gate and still above
   // Apple Spatial Capture’s ~0.08 m default — enough overlap for room-scale 3DGS
   // without flooding near-duplicates. Blur/speed gates stay strict so density
-  // does not come from smear.
+  // does not come from smear. Steady windows (blur ≤ 0.22 + deliberate pace)
+  // get a lower translation floor so sharp wall-loop steps are not blocked at
+  // 0.14 m — PocketGS / object-centered capture densify during stable candidate
+  // windows without relaxing smear rejection. Rotation/interval stay at defaults.
   private let minTranslation: Float = 0.14      // m
+  private let minTranslationSteady: Float = 0.10 // m — when steady window
   private let minRotationDeg: Float = 18
   private let minSharpness01: Float = 0.38
   private let minSharpnessRaw: Float = 45
@@ -24,6 +28,9 @@ final class KeyframeWriter {
   private let maxSpeed: Float = 0.45            // m/s
   private let maxAngularSpeed: Float = 28       // deg/s
   private let minCaptureInterval: TimeInterval = 0.9
+  private let steadyBlurRiskMax: Float = 0.22   // same steady floor as isSharpEnough
+  private let steadySpeedMax: Float = 0.28      // m/s — deliberate walk, well under 0.45
+  private let steadyAngularSpeedMax: Float = 18 // deg/s — slow yaw, well under 28
 
   private let sharpnessProbe = FrameQualityAnalyzer()
   private var keyframeTransforms: [simd_float4x4] = []
@@ -58,14 +65,30 @@ final class KeyframeWriter {
 
   var keyframeCount: Int { entries.count }
 
+  /// True when preview metrics say the phone is in a sharp, deliberate-motion window.
+  /// Reuses the same blur ≤ 0.22 floor as the steady sharpness path; speed/angular
+  /// caps sit well below the hard reject gates so short-exposure high-speed frames
+  /// do not inherit the denser translation baseline.
+  private func isSteadyWindow(_ metrics: FrameMetrics) -> Bool {
+    metrics.motionBlurRisk <= steadyBlurRiskMax
+      && metrics.speed <= steadySpeedMax
+      && metrics.angularSpeed <= steadyAngularSpeedMax
+  }
+
+  /// Translation novelty floor: lower only while the frame is already steady.
+  /// Default stays 0.14 m; blur/speed/sharpness/rotation/interval reject gates unchanged.
+  private func effectiveMinTranslation(for metrics: FrameMetrics) -> Float {
+    isSteadyWindow(metrics) ? minTranslationSteady : minTranslation
+  }
+
   /// True when `candidate` is too close (pose) to any already-saved keyframe.
-  private func isTooSimilar(to candidate: simd_float4x4) -> Bool {
+  private func isTooSimilar(to candidate: simd_float4x4, minTranslationMeters: Float) -> Bool {
     let camPos = simd_float3(candidate.columns.3.x, candidate.columns.3.y, candidate.columns.3.z)
     let camQuat = simd_quatf(candidate)
     for existing in keyframeTransforms {
       let ep = simd_float3(existing.columns.3.x, existing.columns.3.y, existing.columns.3.z)
       let translation = simd_length(camPos - ep)
-      if translation < minTranslation {
+      if translation < minTranslationMeters {
         let dq = camQuat * simd_quatf(existing).inverse
         let rotationDeg = abs(dq.angle) * 180 / .pi
         if rotationDeg < minRotationDeg {
@@ -88,7 +111,8 @@ final class KeyframeWriter {
     guard now - lastCaptureTime >= minCaptureInterval else { return }
 
     let transform = frame.camera.transform
-    if !keyframeTransforms.isEmpty, isTooSimilar(to: transform) {
+    let translationGate = effectiveMinTranslation(for: metrics)
+    if !keyframeTransforms.isEmpty, isTooSimilar(to: transform, minTranslationMeters: translationGate) {
       return
     }
 
