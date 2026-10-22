@@ -24,6 +24,17 @@ final class KeyframeWriter {
   private let maxSpeed: Float = 0.45            // m/s
   private let maxAngularSpeed: Float = 28       // deg/s
   private let minCaptureInterval: TimeInterval = 0.9
+  /// Wall-parallel (lateral) cadence densify — after pose novelty, the flat
+  /// 0.9 s wall still discards sharp strafe frames; 0.65 s (~1.5 Hz) matches
+  /// 3DGS capture guides’ ~1–3 keyframes/s band without loosening blur gates.
+  private let lateralMinCaptureInterval: TimeInterval = 0.65
+  /// Preview blur floor shared with `isSharpEnough` steady path — densify only
+  /// when the frame is already a steady keep, not by tolerating smear.
+  private let lateralBlurMax: Float = 0.22
+  /// Ignore near-stationary IMU jitter when classifying travel direction.
+  private let lateralSpeedMin: Float = 0.06      // m/s
+  /// |travel · forward| below this ⇒ mostly sideways (parallax-producing).
+  private let lateralDotMax: Float = 0.40
 
   private let sharpnessProbe = FrameQualityAnalyzer()
   private var keyframeTransforms: [simd_float4x4] = []
@@ -58,6 +69,17 @@ final class KeyframeWriter {
 
   var keyframeCount: Int { entries.count }
 
+  /// True when travel is mostly wall-parallel and the preview is already steady.
+  private func isLateralParallaxMotion(_ metrics: FrameMetrics) -> Bool {
+    guard metrics.motionBlurRisk <= lateralBlurMax else { return false }
+    guard metrics.speed >= lateralSpeedMin else { return false }
+    return abs(metrics.travelDotForward) <= lateralDotMax
+  }
+
+  private func effectiveMinCaptureInterval(for metrics: FrameMetrics) -> TimeInterval {
+    isLateralParallaxMotion(metrics) ? lateralMinCaptureInterval : minCaptureInterval
+  }
+
   /// True when `candidate` is too close (pose) to any already-saved keyframe.
   private func isTooSimilar(to candidate: simd_float4x4) -> Bool {
     let camPos = simd_float3(candidate.columns.3.x, candidate.columns.3.y, candidate.columns.3.z)
@@ -85,7 +107,8 @@ final class KeyframeWriter {
     guard !captureInFlight else { return }
 
     let now = CACurrentMediaTime()
-    guard now - lastCaptureTime >= minCaptureInterval else { return }
+    let intervalFloor = effectiveMinCaptureInterval(for: metrics)
+    guard now - lastCaptureTime >= intervalFloor else { return }
 
     let transform = frame.camera.transform
     if !keyframeTransforms.isEmpty, isTooSimilar(to: transform) {
