@@ -18,12 +18,23 @@ final class KeyframeWriter {
   // does not come from smear.
   private let minTranslation: Float = 0.14      // m
   private let minRotationDeg: Float = 18
+  /// Wall-parallel (lateral) angular densify — corner toe-in / slight pivots
+  /// during strafes need ~12° novelty (ContextCapture ≤15° consecutive guidance);
+  /// approach/retreat keeps the 18° floor.
+  private let lateralMinRotationDeg: Float = 12
   private let minSharpness01: Float = 0.38
   private let minSharpnessRaw: Float = 45
   private let maxMotionBlurRisk: Float = 0.38
   private let maxSpeed: Float = 0.45            // m/s
   private let maxAngularSpeed: Float = 28       // deg/s
   private let minCaptureInterval: TimeInterval = 0.9
+  /// Preview blur floor shared with `isSharpEnough` steady path — densify only
+  /// when the frame is already a steady keep, not by tolerating smear.
+  private let lateralBlurMax: Float = 0.22
+  /// Ignore near-stationary IMU jitter when classifying travel direction.
+  private let lateralSpeedMin: Float = 0.06      // m/s
+  /// |travel · forward| below this ⇒ mostly sideways (parallax-producing).
+  private let lateralDotMax: Float = 0.40
 
   private let sharpnessProbe = FrameQualityAnalyzer()
   private var keyframeTransforms: [simd_float4x4] = []
@@ -58,8 +69,19 @@ final class KeyframeWriter {
 
   var keyframeCount: Int { entries.count }
 
+  /// True when travel is mostly wall-parallel and the preview is already steady.
+  private func isLateralParallaxMotion(_ metrics: FrameMetrics) -> Bool {
+    guard metrics.motionBlurRisk <= lateralBlurMax else { return false }
+    guard metrics.speed >= lateralSpeedMin else { return false }
+    return abs(metrics.travelDotForward) <= lateralDotMax
+  }
+
+  private func effectiveMinRotationDeg(for metrics: FrameMetrics) -> Float {
+    isLateralParallaxMotion(metrics) ? lateralMinRotationDeg : minRotationDeg
+  }
+
   /// True when `candidate` is too close (pose) to any already-saved keyframe.
-  private func isTooSimilar(to candidate: simd_float4x4) -> Bool {
+  private func isTooSimilar(to candidate: simd_float4x4, minRotationDeg rotationFloor: Float) -> Bool {
     let camPos = simd_float3(candidate.columns.3.x, candidate.columns.3.y, candidate.columns.3.z)
     let camQuat = simd_quatf(candidate)
     for existing in keyframeTransforms {
@@ -68,7 +90,7 @@ final class KeyframeWriter {
       if translation < minTranslation {
         let dq = camQuat * simd_quatf(existing).inverse
         let rotationDeg = abs(dq.angle) * 180 / .pi
-        if rotationDeg < minRotationDeg {
+        if rotationDeg < rotationFloor {
           return true
         }
       }
@@ -88,7 +110,8 @@ final class KeyframeWriter {
     guard now - lastCaptureTime >= minCaptureInterval else { return }
 
     let transform = frame.camera.transform
-    if !keyframeTransforms.isEmpty, isTooSimilar(to: transform) {
+    let rotationFloor = effectiveMinRotationDeg(for: metrics)
+    if !keyframeTransforms.isEmpty, isTooSimilar(to: transform, minRotationDeg: rotationFloor) {
       return
     }
 
