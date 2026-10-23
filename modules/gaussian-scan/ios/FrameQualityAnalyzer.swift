@@ -7,6 +7,9 @@ struct FrameMetrics {
   var sharpness01: Float        // texture-aware 0..1
   var speed: Float              // m/s
   var angularSpeed: Float       // deg/s
+  /// Camera-forward component of travel direction (−1…1). ≈0 when strafing
+  /// (wall-parallel parallax); ≈+1 when walking into the view.
+  var travelDotForward: Float
   var trackingState: String     // "normal" | "limited" | "notAvailable"
   var trackingReason: String    // "" | "initializing" | "excessiveMotion" | "insufficientFeatures" | "relocalizing"
   var lux: Float
@@ -36,15 +39,27 @@ final class FrameQualityAnalyzer {
 
     var speed: Float = 0
     var angularSpeed: Float = 0
+    var travelDotForward: Float = 0
     if let last = lastTransform, lastTimestamp > 0, t > lastTimestamp {
       let dt = Float(t - lastTimestamp)
       let dp = camera.transform.columns.3 - last.columns.3
-      speed = simd_length(simd_float3(dp.x, dp.y, dp.z)) / dt
+      let displacement = simd_float3(dp.x, dp.y, dp.z)
+      speed = simd_length(displacement) / dt
       let qa = simd_quatf(last)
       let qb = simd_quatf(camera.transform)
       let dq = qb * qa.inverse
       let angle = abs(dq.angle) * 180 / .pi
       angularSpeed = min(angle, 180) / dt
+      // ARKit camera looks along −Z; match CoverageEngine / GuidanceEngine forward.
+      let forward = -simd_float3(
+        camera.transform.columns.2.x,
+        camera.transform.columns.2.y,
+        camera.transform.columns.2.z
+      )
+      let travel = simd_length(displacement)
+      if travel > 1e-4, simd_length(forward) > 1e-4 {
+        travelDotForward = simd_dot(displacement / travel, simd_normalize(forward))
+      }
     }
     lastTransform = camera.transform
     lastTimestamp = t
@@ -86,6 +101,7 @@ final class FrameQualityAnalyzer {
       sharpness01: sharpness01,
       speed: speed,
       angularSpeed: angularSpeed,
+      travelDotForward: travelDotForward,
       trackingState: trackingState,
       trackingReason: trackingReason,
       lux: lux,
