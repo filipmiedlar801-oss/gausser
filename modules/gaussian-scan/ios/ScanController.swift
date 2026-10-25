@@ -388,7 +388,16 @@ final class ScanController: NSObject, ARSessionDelegate {
         cachedHoles = engine.holes(maxCount: 8)
         emitCoverage()
       }
-      keyframes?.consider(frame: frame, metrics: metrics)
+      // Match GuidanceEngine `more_angles`: once walls are mostly seen from a single
+      // direction, densify capture cadence so pose-novel second-pass frames land
+      // before the 0.9 s interval wall discards them.
+      let scanDuration = now - scanStartTime
+      let needsMoreAngles = scanDuration > 35
+        && cachedStats.totalSamples > 0
+        && cachedStats.yellow > 0.28
+        && cachedStats.red < 0.22
+        && cachedStats.green < 0.55
+      keyframes?.consider(frame: frame, metrics: metrics, needsMoreAngles: needsMoreAngles)
     }
 
     // Waypoint bearing relative to the camera
