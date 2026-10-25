@@ -14,8 +14,10 @@ final class KeyframeWriter {
   // Selection thresholds — must differ from every existing pose, not only the last.
   // Pose spacing: 0.14 m is ~2× denser than the old 0.28 m gate and still above
   // Apple Spatial Capture’s ~0.08 m default — enough overlap for room-scale 3DGS
-  // without flooding near-duplicates. Blur/speed gates stay strict so density
-  // does not come from smear.
+  // without flooding near-duplicates. When coverage is yellow-dominant (surfaces
+  // seen from only one direction), the capture interval drops to 0.65 s so
+  // second-pass orbit frames that already clear pose novelty are not discarded
+  // by the time gate. Blur/speed gates stay strict; coverage alone never fires.
   private let minTranslation: Float = 0.14      // m
   private let minRotationDeg: Float = 18
   private let minSharpness01: Float = 0.38
@@ -24,6 +26,7 @@ final class KeyframeWriter {
   private let maxSpeed: Float = 0.45            // m/s
   private let maxAngularSpeed: Float = 28       // deg/s
   private let minCaptureInterval: TimeInterval = 0.9
+  private let minCaptureIntervalMoreAngles: TimeInterval = 0.65 // yellow-dominant multi-view only
 
   private let sharpnessProbe = FrameQualityAnalyzer()
   private var keyframeTransforms: [simd_float4x4] = []
@@ -77,7 +80,11 @@ final class KeyframeWriter {
   }
 
   /// Called on the analysis queue for every analyzed frame.
-  func consider(frame: ARFrame, metrics: FrameMetrics) {
+  /// - Parameter needsMoreAngles: when true (yellow-dominant coverage — same gate as
+  ///   GuidanceEngine `more_angles`), use a shorter capture interval so pose-novel
+  ///   second-pass frames are not discarded by the 0.9 s wall. Does not bypass
+  ///   blur/speed/sharpness/pose gates; coverage still cannot fire captures alone.
+  func consider(frame: ARFrame, metrics: FrameMetrics, needsMoreAngles: Bool = false) {
     guard metrics.trackingState == "normal" else { return }
     guard metrics.motionBlurRisk <= maxMotionBlurRisk else { return }
     guard metrics.speed <= maxSpeed, metrics.angularSpeed <= maxAngularSpeed else { return }
@@ -85,7 +92,8 @@ final class KeyframeWriter {
     guard !captureInFlight else { return }
 
     let now = CACurrentMediaTime()
-    guard now - lastCaptureTime >= minCaptureInterval else { return }
+    let intervalGate = needsMoreAngles ? minCaptureIntervalMoreAngles : minCaptureInterval
+    guard now - lastCaptureTime >= intervalGate else { return }
 
     let transform = frame.camera.transform
     if !keyframeTransforms.isEmpty, isTooSimilar(to: transform) {
