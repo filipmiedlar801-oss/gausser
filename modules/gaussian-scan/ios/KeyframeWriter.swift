@@ -14,9 +14,12 @@ final class KeyframeWriter {
   // Selection thresholds — must differ from every existing pose, not only the last.
   // Pose spacing: 0.14 m is ~2× denser than the old 0.28 m gate and still above
   // Apple Spatial Capture’s ~0.08 m default — enough overlap for room-scale 3DGS
-  // without flooding near-duplicates. Blur/speed gates stay strict so density
-  // does not come from smear.
+  // without flooding near-duplicates. When coverage is yellow-dominant (surfaces
+  // seen from only one direction), translation drops to 0.10 m so second-pass
+  // center-ring / grid walks accumulate cross-angle views without loosening
+  // blur/speed. Coverage alone never fires a capture.
   private let minTranslation: Float = 0.14      // m
+  private let minTranslationMoreAngles: Float = 0.10 // m — yellow-dominant multi-view only
   private let minRotationDeg: Float = 18
   private let minSharpness01: Float = 0.38
   private let minSharpnessRaw: Float = 45
@@ -59,13 +62,13 @@ final class KeyframeWriter {
   var keyframeCount: Int { entries.count }
 
   /// True when `candidate` is too close (pose) to any already-saved keyframe.
-  private func isTooSimilar(to candidate: simd_float4x4) -> Bool {
+  private func isTooSimilar(to candidate: simd_float4x4, minTranslationMeters: Float) -> Bool {
     let camPos = simd_float3(candidate.columns.3.x, candidate.columns.3.y, candidate.columns.3.z)
     let camQuat = simd_quatf(candidate)
     for existing in keyframeTransforms {
       let ep = simd_float3(existing.columns.3.x, existing.columns.3.y, existing.columns.3.z)
       let translation = simd_length(camPos - ep)
-      if translation < minTranslation {
+      if translation < minTranslationMeters {
         let dq = camQuat * simd_quatf(existing).inverse
         let rotationDeg = abs(dq.angle) * 180 / .pi
         if rotationDeg < minRotationDeg {
@@ -77,7 +80,10 @@ final class KeyframeWriter {
   }
 
   /// Called on the analysis queue for every analyzed frame.
-  func consider(frame: ARFrame, metrics: FrameMetrics) {
+  /// - Parameter needsMoreAngles: when true (yellow-dominant coverage — same gate as
+  ///   GuidanceEngine `more_angles`), use a tighter translation baseline so second-pass
+  ///   walks fill cross-angle viewpoints. Does not bypass blur/speed/sharpness/interval.
+  func consider(frame: ARFrame, metrics: FrameMetrics, needsMoreAngles: Bool = false) {
     guard metrics.trackingState == "normal" else { return }
     guard metrics.motionBlurRisk <= maxMotionBlurRisk else { return }
     guard metrics.speed <= maxSpeed, metrics.angularSpeed <= maxAngularSpeed else { return }
@@ -88,7 +94,8 @@ final class KeyframeWriter {
     guard now - lastCaptureTime >= minCaptureInterval else { return }
 
     let transform = frame.camera.transform
-    if !keyframeTransforms.isEmpty, isTooSimilar(to: transform) {
+    let translationGate = needsMoreAngles ? minTranslationMoreAngles : minTranslation
+    if !keyframeTransforms.isEmpty, isTooSimilar(to: transform, minTranslationMeters: translationGate) {
       return
     }
 
