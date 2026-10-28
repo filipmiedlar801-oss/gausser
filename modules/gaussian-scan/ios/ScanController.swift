@@ -388,7 +388,15 @@ final class ScanController: NSObject, ARSessionDelegate {
         cachedHoles = engine.holes(maxCount: 8)
         emitCoverage()
       }
-      keyframes?.consider(frame: frame, metrics: metrics)
+      // First-pass densify while coverage is still mostly unseen (red). Same gate
+      // as red-dominant translation drafts; orthogonal to GuidanceEngine
+      // `more_angles` (yellow-dominant, red < 0.22). Coverage still cannot fire
+      // captures alone — blur/speed/sharpness/pose stay strict.
+      let scanDuration = now - scanStartTime
+      let isRedDominant = scanDuration > 15
+        && cachedStats.totalSamples > 0
+        && cachedStats.red > 0.40
+      keyframes?.consider(frame: frame, metrics: metrics, isRedDominant: isRedDominant)
     }
 
     // Waypoint bearing relative to the camera
