@@ -18,6 +18,14 @@ final class KeyframeWriter {
   // does not come from smear.
   private let minTranslation: Float = 0.14      // m
   private let minRotationDeg: Float = 18
+  /// Secondary elevation layers (rumahku / forensic GS / Aholo 3-height passes):
+  /// once a primary Y band exists, level looks ≥0.25 m off that median use 0.10 m
+  /// so low/high perimeter re-walks densify without waiting for a full 0.14 m step.
+  /// Orthogonal to look-up/down tilt densify (|lookUp| > 0.35). Blur/speed unchanged.
+  private let minTranslationOffPrimaryHeight: Float = 0.10
+  private let offPrimaryHeightMeters: Float = 0.25
+  private let levelLookUpMax: Float = 0.35
+  private let minKeyframesForHeightBand: Int = 8
   private let minSharpness01: Float = 0.38
   private let minSharpnessRaw: Float = 45
   private let maxMotionBlurRisk: Float = 0.38
@@ -58,14 +66,46 @@ final class KeyframeWriter {
 
   var keyframeCount: Int { entries.count }
 
+  /// Camera-forward · worldUp for `candidate` (same signal as GuidanceEngine.lookUp).
+  private func lookUp(of candidate: simd_float4x4) -> Float {
+    let forward = -simd_float3(candidate.columns.2.x, candidate.columns.2.y, candidate.columns.2.z)
+    return forward.y
+  }
+
+  /// Median of saved keyframe camera Y — stable primary elevation band.
+  private func medianKeyframeY() -> Float? {
+    guard keyframeTransforms.count >= minKeyframesForHeightBand else { return nil }
+    let ys = keyframeTransforms.map { $0.columns.3.y }.sorted()
+    let mid = ys.count / 2
+    if ys.count % 2 == 0 {
+      return (ys[mid - 1] + ys[mid]) * 0.5
+    }
+    return ys[mid]
+  }
+
+  /// True when looking mostly level and camera Y is ≥0.25 m off the primary band
+  /// (low/high multi-height pass over an established eye-level capture set).
+  private func isOffPrimaryHeightBand(_ candidate: simd_float4x4) -> Bool {
+    guard abs(lookUp(of: candidate)) <= levelLookUpMax else { return false }
+    guard let medianY = medianKeyframeY() else { return false }
+    let camY = candidate.columns.3.y
+    return abs(camY - medianY) >= offPrimaryHeightMeters
+  }
+
+  /// Room-scale stays 0.14 m; off-primary elevation layers use 0.10 m.
+  private func effectiveMinTranslation(for candidate: simd_float4x4) -> Float {
+    isOffPrimaryHeightBand(candidate) ? minTranslationOffPrimaryHeight : minTranslation
+  }
+
   /// True when `candidate` is too close (pose) to any already-saved keyframe.
   private func isTooSimilar(to candidate: simd_float4x4) -> Bool {
     let camPos = simd_float3(candidate.columns.3.x, candidate.columns.3.y, candidate.columns.3.z)
     let camQuat = simd_quatf(candidate)
+    let translationGate = effectiveMinTranslation(for: candidate)
     for existing in keyframeTransforms {
       let ep = simd_float3(existing.columns.3.x, existing.columns.3.y, existing.columns.3.z)
       let translation = simd_length(camPos - ep)
-      if translation < minTranslation {
+      if translation < translationGate {
         let dq = camQuat * simd_quatf(existing).inverse
         let rotationDeg = abs(dq.angle) * 180 / .pi
         if rotationDeg < minRotationDeg {
