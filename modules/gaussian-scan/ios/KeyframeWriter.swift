@@ -15,9 +15,19 @@ final class KeyframeWriter {
   // Pose spacing: 0.14 m is ~2× denser than the old 0.28 m gate and still above
   // Apple Spatial Capture’s ~0.08 m default — enough overlap for room-scale 3DGS
   // without flooding near-duplicates. Blur/speed gates stay strict so density
-  // does not come from smear.
+  // does not come from smear. Secondary elevation layers (rumahku / forensic GS /
+  // Aholo 3-height passes) use 12° rotation once a primary Y band exists so
+  // low/high perimeter pivots keep angular novelty without loosening blur/speed.
+  // Orthogonal to look-up/down tilt densify (|lookUp| > 0.35).
   private let minTranslation: Float = 0.14      // m
   private let minRotationDeg: Float = 18
+  /// Off-primary elevation layers: level looks ≥0.25 m off median keyframe Y
+  /// use 12° (above Apple Spatial Capture’s ~10°) after ≥8 keyframes establish
+  /// the primary band. Eye-level / early scan keep 18°.
+  private let minRotationDegOffPrimaryHeight: Float = 12
+  private let offPrimaryHeightMeters: Float = 0.25
+  private let levelLookUpMax: Float = 0.35
+  private let minKeyframesForHeightBand: Int = 8
   private let minSharpness01: Float = 0.38
   private let minSharpnessRaw: Float = 45
   private let maxMotionBlurRisk: Float = 0.38
@@ -58,17 +68,51 @@ final class KeyframeWriter {
 
   var keyframeCount: Int { entries.count }
 
+  /// Camera-forward · worldUp for `candidate` (same signal as GuidanceEngine.lookUp).
+  private func lookUp(of candidate: simd_float4x4) -> Float {
+    let forward = -simd_float3(candidate.columns.2.x, candidate.columns.2.y, candidate.columns.2.z)
+    return forward.y
+  }
+
+  /// Median of saved keyframe camera Y — stable primary elevation band.
+  private func medianKeyframeY() -> Float? {
+    guard keyframeTransforms.count >= minKeyframesForHeightBand else { return nil }
+    let ys = keyframeTransforms.map { $0.columns.3.y }.sorted()
+    let mid = ys.count / 2
+    if ys.count % 2 == 0 {
+      return (ys[mid - 1] + ys[mid]) * 0.5
+    }
+    return ys[mid]
+  }
+
+  /// True when looking mostly level and camera Y is ≥0.25 m off the primary band
+  /// (low/high multi-height pass over an established eye-level capture set).
+  private func isOffPrimaryHeightBand(_ candidate: simd_float4x4) -> Bool {
+    guard abs(lookUp(of: candidate)) <= levelLookUpMax else { return false }
+    guard let medianY = medianKeyframeY() else { return false }
+    let camY = candidate.columns.3.y
+    return abs(camY - medianY) >= offPrimaryHeightMeters
+  }
+
+  /// Room-scale stays 18°; off-primary elevation layers use 12° so corner pivots
+  /// and inward toe-in on low/high re-walks keep angular novelty when translation
+  /// is still < 0.14 m.
+  private func effectiveMinRotationDeg(for candidate: simd_float4x4) -> Float {
+    isOffPrimaryHeightBand(candidate) ? minRotationDegOffPrimaryHeight : minRotationDeg
+  }
+
   /// True when `candidate` is too close (pose) to any already-saved keyframe.
   private func isTooSimilar(to candidate: simd_float4x4) -> Bool {
     let camPos = simd_float3(candidate.columns.3.x, candidate.columns.3.y, candidate.columns.3.z)
     let camQuat = simd_quatf(candidate)
+    let rotationGate = effectiveMinRotationDeg(for: candidate)
     for existing in keyframeTransforms {
       let ep = simd_float3(existing.columns.3.x, existing.columns.3.y, existing.columns.3.z)
       let translation = simd_length(camPos - ep)
       if translation < minTranslation {
         let dq = camQuat * simd_quatf(existing).inverse
         let rotationDeg = abs(dq.angle) * 180 / .pi
-        if rotationDeg < minRotationDeg {
+        if rotationDeg < rotationGate {
           return true
         }
       }
