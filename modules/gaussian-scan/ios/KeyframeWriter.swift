@@ -15,7 +15,10 @@ final class KeyframeWriter {
   // Pose spacing: 0.14 m is ~2× denser than the old 0.28 m gate and still above
   // Apple Spatial Capture’s ~0.08 m default — enough overlap for room-scale 3DGS
   // without flooding near-duplicates. Blur/speed gates stay strict so density
-  // does not come from smear.
+  // does not come from smear. Secondary elevation layers (rumahku / forensic GS /
+  // Aholo 3-height passes) use a denser capture cadence once a primary Y band
+  // exists so low/high perimeter re-walks keep in-layer overlap after pose
+  // novelty passes. Orthogonal to look-up/down tilt densify (|lookUp| > 0.35).
   private let minTranslation: Float = 0.14      // m
   private let minRotationDeg: Float = 18
   private let minSharpness01: Float = 0.38
@@ -24,6 +27,14 @@ final class KeyframeWriter {
   private let maxSpeed: Float = 0.45            // m/s
   private let maxAngularSpeed: Float = 28       // deg/s
   private let minCaptureInterval: TimeInterval = 0.9
+  /// Off-primary elevation layers: level looks ≥0.25 m off median keyframe Y
+  /// use 0.65 s after ≥8 keyframes establish the primary band. Eye-level /
+  /// early scan keep 0.9 s. Same elevation gate as multi-height translation/
+  /// rotation densify; blur/speed/pose gates unchanged.
+  private let minCaptureIntervalOffPrimaryHeight: TimeInterval = 0.65
+  private let offPrimaryHeightMeters: Float = 0.25
+  private let levelLookUpMax: Float = 0.35
+  private let minKeyframesForHeightBand: Int = 8
 
   private let sharpnessProbe = FrameQualityAnalyzer()
   private var keyframeTransforms: [simd_float4x4] = []
@@ -58,6 +69,38 @@ final class KeyframeWriter {
 
   var keyframeCount: Int { entries.count }
 
+  /// Camera-forward · worldUp for `candidate` (same signal as GuidanceEngine.lookUp).
+  private func lookUp(of candidate: simd_float4x4) -> Float {
+    let forward = -simd_float3(candidate.columns.2.x, candidate.columns.2.y, candidate.columns.2.z)
+    return forward.y
+  }
+
+  /// Median of saved keyframe camera Y — stable primary elevation band.
+  private func medianKeyframeY() -> Float? {
+    guard keyframeTransforms.count >= minKeyframesForHeightBand else { return nil }
+    let ys = keyframeTransforms.map { $0.columns.3.y }.sorted()
+    let mid = ys.count / 2
+    if ys.count % 2 == 0 {
+      return (ys[mid - 1] + ys[mid]) * 0.5
+    }
+    return ys[mid]
+  }
+
+  /// True when looking mostly level and camera Y is ≥0.25 m off the primary band
+  /// (low/high multi-height pass over an established eye-level capture set).
+  private func isOffPrimaryHeightBand(_ candidate: simd_float4x4) -> Bool {
+    guard abs(lookUp(of: candidate)) <= levelLookUpMax else { return false }
+    guard let medianY = medianKeyframeY() else { return false }
+    let camY = candidate.columns.3.y
+    return abs(camY - medianY) >= offPrimaryHeightMeters
+  }
+
+  /// Room-scale stays 0.9 s; off-primary elevation layers use 0.65 s so sharp
+  /// pose-novel frames on low/high re-walks are not discarded by the interval wall.
+  private func effectiveMinCaptureInterval(for candidate: simd_float4x4) -> TimeInterval {
+    isOffPrimaryHeightBand(candidate) ? minCaptureIntervalOffPrimaryHeight : minCaptureInterval
+  }
+
   /// True when `candidate` is too close (pose) to any already-saved keyframe.
   private func isTooSimilar(to candidate: simd_float4x4) -> Bool {
     let camPos = simd_float3(candidate.columns.3.x, candidate.columns.3.y, candidate.columns.3.z)
@@ -84,10 +127,10 @@ final class KeyframeWriter {
     guard isSharpEnough(sharpness01: metrics.sharpness01, sharpnessRaw: metrics.sharpness, motionBlurRisk: metrics.motionBlurRisk) else { return }
     guard !captureInFlight else { return }
 
-    let now = CACurrentMediaTime()
-    guard now - lastCaptureTime >= minCaptureInterval else { return }
-
     let transform = frame.camera.transform
+    let now = CACurrentMediaTime()
+    guard now - lastCaptureTime >= effectiveMinCaptureInterval(for: transform) else { return }
+
     if !keyframeTransforms.isEmpty, isTooSimilar(to: transform) {
       return
     }
