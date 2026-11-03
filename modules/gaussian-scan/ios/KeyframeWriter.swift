@@ -18,6 +18,14 @@ final class KeyframeWriter {
   // does not come from smear.
   private let minTranslation: Float = 0.14      // m
   private let minRotationDeg: Float = 18
+  /// XGRIDS Pass 3 / Scaniverse overview re-walk the same routes with the lens
+  /// tilted up/down. Awkward posture often yields 0.10–0.13 m steps that the
+  /// flat 0.14 m floor drops — densify translation only while looking at
+  /// ceiling/floor (|lookUp| > 0.35, same signal as GuidanceEngine). Completes
+  /// the look-up/down triad with rotation (#17) and interval (#18). Level look
+  /// stays 0.14 m. Blur/speed unchanged.
+  private let verticalLookTranslation: Float = 0.10
+  private let verticalLookUpThreshold: Float = 0.35
   private let minSharpness01: Float = 0.38
   private let minSharpnessRaw: Float = 45
   private let maxMotionBlurRisk: Float = 0.38
@@ -58,14 +66,28 @@ final class KeyframeWriter {
 
   var keyframeCount: Int { entries.count }
 
+  /// Camera-forward · worldUp for `candidate` (same signal as GuidanceEngine.lookUp).
+  private func lookUp(of candidate: simd_float4x4) -> Float {
+    let forward = -simd_float3(candidate.columns.2.x, candidate.columns.2.y, candidate.columns.2.z)
+    return forward.y
+  }
+
+  /// Room-scale stays 0.14 m; ceiling/floor tilt re-walks use 0.10 m.
+  private func effectiveMinTranslation(for candidate: simd_float4x4) -> Float {
+    abs(lookUp(of: candidate)) > verticalLookUpThreshold
+      ? verticalLookTranslation
+      : minTranslation
+  }
+
   /// True when `candidate` is too close (pose) to any already-saved keyframe.
   private func isTooSimilar(to candidate: simd_float4x4) -> Bool {
     let camPos = simd_float3(candidate.columns.3.x, candidate.columns.3.y, candidate.columns.3.z)
     let camQuat = simd_quatf(candidate)
+    let translationGate = effectiveMinTranslation(for: candidate)
     for existing in keyframeTransforms {
       let ep = simd_float3(existing.columns.3.x, existing.columns.3.y, existing.columns.3.z)
       let translation = simd_length(camPos - ep)
-      if translation < minTranslation {
+      if translation < translationGate {
         let dq = camQuat * simd_quatf(existing).inverse
         let rotationDeg = abs(dq.angle) * 180 / .pi
         if rotationDeg < minRotationDeg {
