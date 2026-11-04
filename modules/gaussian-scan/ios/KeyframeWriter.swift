@@ -25,6 +25,15 @@ final class KeyframeWriter {
   private let maxAngularSpeed: Float = 28       // deg/s
   private let minCaptureInterval: TimeInterval = 0.9
 
+  // Mild tilt (~10–20°) for wall–floor / wall–ceiling junction walks.
+  // Polycam Pass 1 aims slightly down; Scaniverse overview varies tilt while
+  // walking. Open ceiling/floor drafts densify only when |lookUp| > 0.35;
+  // multi-height drafts keep |lookUp| ≤ 0.35 but need a 0.25 m elevation
+  // offset. This band fills that gap without overlapping either.
+  private let junctionLookUpMin: Float = 0.18
+  private let junctionLookUpMax: Float = 0.35
+  private let junctionLookTranslation: Float = 0.10
+
   private let sharpnessProbe = FrameQualityAnalyzer()
   private var keyframeTransforms: [simd_float4x4] = []
   private var lastCaptureTime: TimeInterval = 0
@@ -58,14 +67,30 @@ final class KeyframeWriter {
 
   var keyframeCount: Int { entries.count }
 
+  /// Camera-forward · worldUp (same signal as GuidanceEngine.lookUp).
+  private func lookUp(of candidate: simd_float4x4) -> Float {
+    let forward = -simd_float3(candidate.columns.2.x, candidate.columns.2.y, candidate.columns.2.z)
+    return forward.y
+  }
+
+  /// Room default 0.14 m; mild junction tilt (~10–20°) uses 0.10 m.
+  private func effectiveMinTranslation(for candidate: simd_float4x4) -> Float {
+    let tilt = abs(lookUp(of: candidate))
+    if tilt > junctionLookUpMin && tilt <= junctionLookUpMax {
+      return junctionLookTranslation
+    }
+    return minTranslation
+  }
+
   /// True when `candidate` is too close (pose) to any already-saved keyframe.
   private func isTooSimilar(to candidate: simd_float4x4) -> Bool {
     let camPos = simd_float3(candidate.columns.3.x, candidate.columns.3.y, candidate.columns.3.z)
     let camQuat = simd_quatf(candidate)
+    let translationFloor = effectiveMinTranslation(for: candidate)
     for existing in keyframeTransforms {
       let ep = simd_float3(existing.columns.3.x, existing.columns.3.y, existing.columns.3.z)
       let translation = simd_length(camPos - ep)
-      if translation < minTranslation {
+      if translation < translationFloor {
         let dq = camQuat * simd_quatf(existing).inverse
         let rotationDeg = abs(dq.angle) * 180 / .pi
         if rotationDeg < minRotationDeg {
