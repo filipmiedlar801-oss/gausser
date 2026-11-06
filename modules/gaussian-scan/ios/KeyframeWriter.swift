@@ -25,6 +25,18 @@ final class KeyframeWriter {
   private let maxAngularSpeed: Float = 28       // deg/s
   private let minCaptureInterval: TimeInterval = 0.9
 
+  // Mild tilt (~10–20°) for wall–floor / wall–ceiling junction walks.
+  // Polycam Pass 1 aims slightly down and asks for straight-on / 45° / 90°
+  // at corners; Scaniverse overview varies tilt while walking and keeping
+  // prior features visible. Steep ceiling/floor drafts densify cadence only
+  // when |lookUp| > 0.35; this band is the interval companion to open
+  // PR #38 (translation) / #39 (rotation) so pose-novel mild-tilt frames
+  // are not discarded by the 0.9 s wall. 0.65 s still sits near
+  // Polycam-class auto rates and does not loosen blur/speed/pose gates.
+  private let junctionLookUpMin: Float = 0.18
+  private let junctionLookUpMax: Float = 0.35
+  private let junctionLookCaptureInterval: TimeInterval = 0.65
+
   private let sharpnessProbe = FrameQualityAnalyzer()
   private var keyframeTransforms: [simd_float4x4] = []
   private var lastCaptureTime: TimeInterval = 0
@@ -58,6 +70,22 @@ final class KeyframeWriter {
 
   var keyframeCount: Int { entries.count }
 
+  /// Camera-forward · worldUp (same signal as GuidanceEngine.lookUp).
+  private func lookUp(of candidate: simd_float4x4) -> Float {
+    let forward = -simd_float3(candidate.columns.2.x, candidate.columns.2.y, candidate.columns.2.z)
+    return forward.y
+  }
+
+  /// Room-scale stays 0.9 s; mild junction tilt (~10–20°) uses 0.65 s so
+  /// sharp pose-novel corner frames are not discarded by the interval wall.
+  private func effectiveMinCaptureInterval(for candidate: simd_float4x4) -> TimeInterval {
+    let tilt = abs(lookUp(of: candidate))
+    if tilt > junctionLookUpMin && tilt <= junctionLookUpMax {
+      return junctionLookCaptureInterval
+    }
+    return minCaptureInterval
+  }
+
   /// True when `candidate` is too close (pose) to any already-saved keyframe.
   private func isTooSimilar(to candidate: simd_float4x4) -> Bool {
     let camPos = simd_float3(candidate.columns.3.x, candidate.columns.3.y, candidate.columns.3.z)
@@ -84,10 +112,10 @@ final class KeyframeWriter {
     guard isSharpEnough(sharpness01: metrics.sharpness01, sharpnessRaw: metrics.sharpness, motionBlurRisk: metrics.motionBlurRisk) else { return }
     guard !captureInFlight else { return }
 
-    let now = CACurrentMediaTime()
-    guard now - lastCaptureTime >= minCaptureInterval else { return }
-
     let transform = frame.camera.transform
+    let now = CACurrentMediaTime()
+    guard now - lastCaptureTime >= effectiveMinCaptureInterval(for: transform) else { return }
+
     if !keyframeTransforms.isEmpty, isTooSimilar(to: transform) {
       return
     }
