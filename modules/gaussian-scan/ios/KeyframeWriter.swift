@@ -15,7 +15,10 @@ final class KeyframeWriter {
   // Pose spacing: 0.14 m is ~2× denser than the old 0.28 m gate and still above
   // Apple Spatial Capture’s ~0.08 m default — enough overlap for room-scale 3DGS
   // without flooding near-duplicates. Blur/speed gates stay strict so density
-  // does not come from smear.
+  // does not come from smear. Bright short-shutter windows (≤ 1/100 s + blur
+  // ≤ 0.22) get a shorter interval so sharp pose-novel frames are not discarded
+  // on the 0.9 s wall — rumahku / Reflct capture guides prioritize short shutter
+  // for freeze-motion density without relaxing smear rejection.
   private let minTranslation: Float = 0.14      // m
   private let minRotationDeg: Float = 18
   private let minSharpness01: Float = 0.38
@@ -24,6 +27,11 @@ final class KeyframeWriter {
   private let maxSpeed: Float = 0.45            // m/s
   private let maxAngularSpeed: Float = 28       // deg/s
   private let minCaptureInterval: TimeInterval = 0.9
+  private let minCaptureIntervalShortExposure: TimeInterval = 0.65 // s — bright shutter
+  /// ≤ 1/100 s — handheld indoor freeze-motion rule of thumb (rumahku tuning guide).
+  private let shortExposureMaxDuration: Float = 0.010
+  /// Same steady blur floor as `isSharpEnough` relaxed path / open steady-window PR.
+  private let shortExposureBlurRiskMax: Float = 0.22
 
   private let sharpnessProbe = FrameQualityAnalyzer()
   private var keyframeTransforms: [simd_float4x4] = []
@@ -58,6 +66,22 @@ final class KeyframeWriter {
 
   var keyframeCount: Int { entries.count }
 
+  /// True when ARKit reports a short shutter and preview blur is already low.
+  /// Complementary to open steady-window interval densify (PR #22), which caps
+  /// speed/angular: short shutter can keep blur ≤ 0.22 during slightly faster
+  /// bright-room walks/pivots that those motion caps would exclude.
+  private func isShortExposureWindow(_ metrics: FrameMetrics) -> Bool {
+    metrics.exposureDuration > 0
+      && metrics.exposureDuration <= shortExposureMaxDuration
+      && metrics.motionBlurRisk <= shortExposureBlurRiskMax
+  }
+
+  /// Capture cadence: faster only while shutter is short and blur risk is low.
+  /// Default stays 0.9 s; blur/speed/sharpness/pose reject gates are unchanged.
+  private func effectiveMinCaptureInterval(for metrics: FrameMetrics) -> TimeInterval {
+    isShortExposureWindow(metrics) ? minCaptureIntervalShortExposure : minCaptureInterval
+  }
+
   /// True when `candidate` is too close (pose) to any already-saved keyframe.
   private func isTooSimilar(to candidate: simd_float4x4) -> Bool {
     let camPos = simd_float3(candidate.columns.3.x, candidate.columns.3.y, candidate.columns.3.z)
@@ -85,7 +109,7 @@ final class KeyframeWriter {
     guard !captureInFlight else { return }
 
     let now = CACurrentMediaTime()
-    guard now - lastCaptureTime >= minCaptureInterval else { return }
+    guard now - lastCaptureTime >= effectiveMinCaptureInterval(for: metrics) else { return }
 
     let transform = frame.camera.transform
     if !keyframeTransforms.isEmpty, isTooSimilar(to: transform) {
