@@ -15,7 +15,9 @@ final class KeyframeWriter {
   // Pose spacing: 0.14 m is ~2× denser than the old 0.28 m gate and still above
   // Apple Spatial Capture’s ~0.08 m default — enough overlap for room-scale 3DGS
   // without flooding near-duplicates. Blur/speed gates stay strict so density
-  // does not come from smear.
+  // does not come from smear. Approach/retreat walks get a shorter interval
+  // because close-range FOV/occlusion changes fast (MipMap / Polycam detail
+  // passes) and a flat 0.9 s wall wastes pose-novel sharp frames.
   private let minTranslation: Float = 0.14      // m
   private let minRotationDeg: Float = 18
   private let minSharpness01: Float = 0.38
@@ -24,6 +26,19 @@ final class KeyframeWriter {
   private let maxSpeed: Float = 0.45            // m/s
   private let maxAngularSpeed: Float = 28       // deg/s
   private let minCaptureInterval: TimeInterval = 0.9
+  /// Approach/retreat cadence densify — after pose novelty, the flat 0.9 s
+  /// wall discards sharp radial steps; 0.65 s (~1.5 Hz) matches 3DGS guides’
+  /// ~1–3 keyframes/s band without loosening blur gates. Complements open
+  /// radial translation densify (PR #42) so the tighter spacing can fire.
+  private let radialMinCaptureInterval: TimeInterval = 0.65
+  /// Preview blur floor shared with `isSharpEnough` steady path — densify only
+  /// when the frame is already a steady keep, not by tolerating smear.
+  private let radialBlurMax: Float = 0.22
+  /// Ignore near-stationary IMU jitter when classifying travel direction.
+  private let radialSpeedMin: Float = 0.06      // m/s
+  /// |travel · forward| above this ⇒ mostly approach/retreat (scale-changing).
+  /// Leaves a dead band vs lateral drafts (|dot| ≤ 0.40) so both can merge.
+  private let radialDotMin: Float = 0.70
 
   private let sharpnessProbe = FrameQualityAnalyzer()
   private var keyframeTransforms: [simd_float4x4] = []
@@ -58,6 +73,17 @@ final class KeyframeWriter {
 
   var keyframeCount: Int { entries.count }
 
+  /// True when travel is mostly toward/away from the look direction and steady.
+  private func isRadialApproachRetreatMotion(_ metrics: FrameMetrics) -> Bool {
+    guard metrics.motionBlurRisk <= radialBlurMax else { return false }
+    guard metrics.speed >= radialSpeedMin else { return false }
+    return abs(metrics.travelDotForward) >= radialDotMin
+  }
+
+  private func effectiveMinCaptureInterval(for metrics: FrameMetrics) -> TimeInterval {
+    isRadialApproachRetreatMotion(metrics) ? radialMinCaptureInterval : minCaptureInterval
+  }
+
   /// True when `candidate` is too close (pose) to any already-saved keyframe.
   private func isTooSimilar(to candidate: simd_float4x4) -> Bool {
     let camPos = simd_float3(candidate.columns.3.x, candidate.columns.3.y, candidate.columns.3.z)
@@ -85,7 +111,7 @@ final class KeyframeWriter {
     guard !captureInFlight else { return }
 
     let now = CACurrentMediaTime()
-    guard now - lastCaptureTime >= minCaptureInterval else { return }
+    guard now - lastCaptureTime >= effectiveMinCaptureInterval(for: metrics) else { return }
 
     let transform = frame.camera.transform
     if !keyframeTransforms.isEmpty, isTooSimilar(to: transform) {
