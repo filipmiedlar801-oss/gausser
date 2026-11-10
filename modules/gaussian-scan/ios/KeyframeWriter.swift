@@ -18,12 +18,25 @@ final class KeyframeWriter {
   // does not come from smear.
   private let minTranslation: Float = 0.14      // m
   private let minRotationDeg: Float = 18
+  /// Approach/retreat (radial) pivots — Scaniverse / indoor 3DGS guides ask for
+  /// multiple angles while closing distance; 12° stays above Apple Spatial
+  /// Capture (~10°) while wall-parallel walks keep the 18° floor. Completes
+  /// the radial triad with open translation (#42) and interval (#43).
+  private let radialMinRotationDeg: Float = 12
   private let minSharpness01: Float = 0.38
   private let minSharpnessRaw: Float = 45
   private let maxMotionBlurRisk: Float = 0.38
   private let maxSpeed: Float = 0.45            // m/s
   private let maxAngularSpeed: Float = 28       // deg/s
   private let minCaptureInterval: TimeInterval = 0.9
+  /// Preview blur floor shared with `isSharpEnough` steady path — densify only
+  /// when the frame is already a steady keep, not by tolerating smear.
+  private let radialBlurMax: Float = 0.22
+  /// Ignore near-stationary IMU jitter when classifying travel direction.
+  private let radialSpeedMin: Float = 0.06      // m/s
+  /// |travel · forward| above this ⇒ mostly approach/retreat (scale-changing).
+  /// Leaves a dead band vs lateral drafts (|dot| ≤ 0.40) so both can merge.
+  private let radialDotMin: Float = 0.70
 
   private let sharpnessProbe = FrameQualityAnalyzer()
   private var keyframeTransforms: [simd_float4x4] = []
@@ -58,8 +71,19 @@ final class KeyframeWriter {
 
   var keyframeCount: Int { entries.count }
 
+  /// True when travel is mostly toward/away from the look direction and steady.
+  private func isRadialApproachRetreatMotion(_ metrics: FrameMetrics) -> Bool {
+    guard metrics.motionBlurRisk <= radialBlurMax else { return false }
+    guard metrics.speed >= radialSpeedMin else { return false }
+    return abs(metrics.travelDotForward) >= radialDotMin
+  }
+
+  private func effectiveMinRotationDeg(for metrics: FrameMetrics) -> Float {
+    isRadialApproachRetreatMotion(metrics) ? radialMinRotationDeg : minRotationDeg
+  }
+
   /// True when `candidate` is too close (pose) to any already-saved keyframe.
-  private func isTooSimilar(to candidate: simd_float4x4) -> Bool {
+  private func isTooSimilar(to candidate: simd_float4x4, minRotationDeg rotationGate: Float) -> Bool {
     let camPos = simd_float3(candidate.columns.3.x, candidate.columns.3.y, candidate.columns.3.z)
     let camQuat = simd_quatf(candidate)
     for existing in keyframeTransforms {
@@ -68,7 +92,7 @@ final class KeyframeWriter {
       if translation < minTranslation {
         let dq = camQuat * simd_quatf(existing).inverse
         let rotationDeg = abs(dq.angle) * 180 / .pi
-        if rotationDeg < minRotationDeg {
+        if rotationDeg < rotationGate {
           return true
         }
       }
@@ -88,7 +112,8 @@ final class KeyframeWriter {
     guard now - lastCaptureTime >= minCaptureInterval else { return }
 
     let transform = frame.camera.transform
-    if !keyframeTransforms.isEmpty, isTooSimilar(to: transform) {
+    let rotationGate = effectiveMinRotationDeg(for: metrics)
+    if !keyframeTransforms.isEmpty, isTooSimilar(to: transform, minRotationDeg: rotationGate) {
       return
     }
 
