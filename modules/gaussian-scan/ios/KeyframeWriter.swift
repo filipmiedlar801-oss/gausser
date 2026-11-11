@@ -15,8 +15,14 @@ final class KeyframeWriter {
   // Pose spacing: 0.14 m is ~2× denser than the old 0.28 m gate and still above
   // Apple Spatial Capture’s ~0.08 m default — enough overlap for room-scale 3DGS
   // without flooding near-duplicates. Blur/speed gates stay strict so density
-  // does not come from smear.
+  // does not come from smear. Bright short-shutter windows (≤ 1/100 s + blur
+  // ≤ 0.22) use a milder translation floor so slow indoor walks can land the
+  // denser samples that open short-exposure interval densify (PR #41) unlocks
+  // in time — without relaxing smear rejection.
   private let minTranslation: Float = 0.14      // m
+  /// Short bright shutter densify — companion to open interval PR #41.
+  /// 0.10 m still above Apple Spatial Capture (~0.08 m); default walks keep 0.14.
+  private let shortExposureMinTranslation: Float = 0.10
   private let minRotationDeg: Float = 18
   private let minSharpness01: Float = 0.38
   private let minSharpnessRaw: Float = 45
@@ -24,6 +30,10 @@ final class KeyframeWriter {
   private let maxSpeed: Float = 0.45            // m/s
   private let maxAngularSpeed: Float = 28       // deg/s
   private let minCaptureInterval: TimeInterval = 0.9
+  /// ≤ 1/100 s — handheld indoor freeze-motion rule of thumb (rumahku / Reflct).
+  private let shortExposureMaxDuration: Float = 0.010
+  /// Same steady blur floor as `isSharpEnough` relaxed path / open steady-window PR.
+  private let shortExposureBlurRiskMax: Float = 0.22
 
   private let sharpnessProbe = FrameQualityAnalyzer()
   private var keyframeTransforms: [simd_float4x4] = []
@@ -58,14 +68,29 @@ final class KeyframeWriter {
 
   var keyframeCount: Int { entries.count }
 
+  /// True when ARKit reports a short shutter and preview blur is already low.
+  /// Same gate as open short-exposure interval densify (PR #41); complementary
+  /// to travel-direction / lookUp / coverage scoped drafts.
+  private func isShortExposureWindow(_ metrics: FrameMetrics) -> Bool {
+    metrics.exposureDuration > 0
+      && metrics.exposureDuration <= shortExposureMaxDuration
+      && metrics.motionBlurRisk <= shortExposureBlurRiskMax
+  }
+
+  /// Pose translation floor: milder only while shutter is short and blur risk is low.
+  /// Default stays 0.14 m; rotation/interval/blur/speed/sharpness gates unchanged.
+  private func effectiveMinTranslation(for metrics: FrameMetrics) -> Float {
+    isShortExposureWindow(metrics) ? shortExposureMinTranslation : minTranslation
+  }
+
   /// True when `candidate` is too close (pose) to any already-saved keyframe.
-  private func isTooSimilar(to candidate: simd_float4x4) -> Bool {
+  private func isTooSimilar(to candidate: simd_float4x4, minTranslation translationFloor: Float) -> Bool {
     let camPos = simd_float3(candidate.columns.3.x, candidate.columns.3.y, candidate.columns.3.z)
     let camQuat = simd_quatf(candidate)
     for existing in keyframeTransforms {
       let ep = simd_float3(existing.columns.3.x, existing.columns.3.y, existing.columns.3.z)
       let translation = simd_length(camPos - ep)
-      if translation < minTranslation {
+      if translation < translationFloor {
         let dq = camQuat * simd_quatf(existing).inverse
         let rotationDeg = abs(dq.angle) * 180 / .pi
         if rotationDeg < minRotationDeg {
@@ -88,7 +113,8 @@ final class KeyframeWriter {
     guard now - lastCaptureTime >= minCaptureInterval else { return }
 
     let transform = frame.camera.transform
-    if !keyframeTransforms.isEmpty, isTooSimilar(to: transform) {
+    let translationFloor = effectiveMinTranslation(for: metrics)
+    if !keyframeTransforms.isEmpty, isTooSimilar(to: transform, minTranslation: translationFloor) {
       return
     }
 
