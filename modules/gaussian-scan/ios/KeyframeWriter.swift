@@ -15,15 +15,28 @@ final class KeyframeWriter {
   // Pose spacing: 0.14 m is ~2× denser than the old 0.28 m gate and still above
   // Apple Spatial Capture’s ~0.08 m default — enough overlap for room-scale 3DGS
   // without flooding near-duplicates. Blur/speed gates stay strict so density
-  // does not come from smear.
+  // does not come from smear. Bright short-shutter windows (≤ 1/100 s + blur
+  // ≤ 0.22) with real translation use a milder rotation floor so walk+gentle-yaw
+  // frames land denser angular coverage — without relaxing smear rejection or
+  // densifying standing spins (LighthouseGS narrow-baseline caution).
   private let minTranslation: Float = 0.14      // m
   private let minRotationDeg: Float = 18
+  /// Short bright shutter pivots — companion to open interval (#41) and
+  /// translation (#45). 12° stays above Apple Spatial Capture (~10°); default
+  /// walks keep 18°. Requires speed ≥ 0.06 so standing spins do not densify.
+  private let shortExposureMinRotationDeg: Float = 12
   private let minSharpness01: Float = 0.38
   private let minSharpnessRaw: Float = 45
   private let maxMotionBlurRisk: Float = 0.38
   private let maxSpeed: Float = 0.45            // m/s
   private let maxAngularSpeed: Float = 28       // deg/s
   private let minCaptureInterval: TimeInterval = 0.9
+  /// ≤ 1/100 s — handheld indoor freeze-motion rule of thumb (rumahku / Reflct).
+  private let shortExposureMaxDuration: Float = 0.010
+  /// Same steady blur floor as `isSharpEnough` relaxed path / open #41/#45.
+  private let shortExposureBlurRiskMax: Float = 0.22
+  /// Ignore near-stationary IMU jitter — standing spins stay on the 18° floor.
+  private let shortExposureSpeedMin: Float = 0.06 // m/s
 
   private let sharpnessProbe = FrameQualityAnalyzer()
   private var keyframeTransforms: [simd_float4x4] = []
@@ -58,8 +71,26 @@ final class KeyframeWriter {
 
   var keyframeCount: Int { entries.count }
 
+  /// True when ARKit reports a short shutter, preview blur is already low, and
+  /// the camera is actually translating. Same shutter/blur gate as open
+  /// short-exposure interval (#41) and translation (#45); speed floor mirrors
+  /// radial rotation (#44) so standing spins do not densify.
+  private func isShortExposureTranslatingWindow(_ metrics: FrameMetrics) -> Bool {
+    metrics.exposureDuration > 0
+      && metrics.exposureDuration <= shortExposureMaxDuration
+      && metrics.motionBlurRisk <= shortExposureBlurRiskMax
+      && metrics.speed >= shortExposureSpeedMin
+  }
+
+  /// Pose rotation floor: milder only while shutter is short, blur is low, and
+  /// the camera is translating. Default stays 18°; translation/interval/blur/
+  /// speed/sharpness gates unchanged on this change.
+  private func effectiveMinRotationDeg(for metrics: FrameMetrics) -> Float {
+    isShortExposureTranslatingWindow(metrics) ? shortExposureMinRotationDeg : minRotationDeg
+  }
+
   /// True when `candidate` is too close (pose) to any already-saved keyframe.
-  private func isTooSimilar(to candidate: simd_float4x4) -> Bool {
+  private func isTooSimilar(to candidate: simd_float4x4, minRotationDeg rotationGate: Float) -> Bool {
     let camPos = simd_float3(candidate.columns.3.x, candidate.columns.3.y, candidate.columns.3.z)
     let camQuat = simd_quatf(candidate)
     for existing in keyframeTransforms {
@@ -68,7 +99,7 @@ final class KeyframeWriter {
       if translation < minTranslation {
         let dq = camQuat * simd_quatf(existing).inverse
         let rotationDeg = abs(dq.angle) * 180 / .pi
-        if rotationDeg < minRotationDeg {
+        if rotationDeg < rotationGate {
           return true
         }
       }
@@ -88,7 +119,8 @@ final class KeyframeWriter {
     guard now - lastCaptureTime >= minCaptureInterval else { return }
 
     let transform = frame.camera.transform
-    if !keyframeTransforms.isEmpty, isTooSimilar(to: transform) {
+    let rotationGate = effectiveMinRotationDeg(for: metrics)
+    if !keyframeTransforms.isEmpty, isTooSimilar(to: transform, minRotationDeg: rotationGate) {
       return
     }
 
