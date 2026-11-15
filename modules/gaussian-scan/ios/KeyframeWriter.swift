@@ -15,15 +15,32 @@ final class KeyframeWriter {
   // Pose spacing: 0.14 m is ~2× denser than the old 0.28 m gate and still above
   // Apple Spatial Capture’s ~0.08 m default — enough overlap for room-scale 3DGS
   // without flooding near-duplicates. Blur/speed gates stay strict so density
-  // does not come from smear.
+  // does not come from smear. Angled / corner walks (diagonal travel between
+  // pure lateral and pure radial) densify rotation when already translating
+  // steadily — completes the diagonal triad with open #47/#48.
   private let minTranslation: Float = 0.14      // m
   private let minRotationDeg: Float = 18
+  /// Diagonal / corner-angled pivots — Polycam 45° corner shots + room-scan
+  /// corner-to-corner parallax; 12° stays above Apple Spatial Capture (~10°)
+  /// while pure lateral / radial keep the 18° floor on this change (open
+  /// #27 / #44). Completes the diagonal triad with open translation (#47)
+  /// and interval (#48).
+  private let diagonalMinRotationDeg: Float = 12
   private let minSharpness01: Float = 0.38
   private let minSharpnessRaw: Float = 45
   private let maxMotionBlurRisk: Float = 0.38
   private let maxSpeed: Float = 0.45            // m/s
   private let maxAngularSpeed: Float = 28       // deg/s
   private let minCaptureInterval: TimeInterval = 0.9
+  /// Preview blur floor shared with `isSharpEnough` steady path — densify only
+  /// when the frame is already a steady keep, not by tolerating smear.
+  private let diagonalBlurMax: Float = 0.22
+  /// Ignore near-stationary IMU jitter — standing spins stay on the 18° floor.
+  private let diagonalSpeedMin: Float = 0.06    // m/s
+  /// Exclusive upper bound vs lateral drafts (|dot| ≤ 0.40).
+  private let diagonalDotMinExclusive: Float = 0.40
+  /// Exclusive lower bound vs radial drafts (|dot| ≥ 0.70).
+  private let diagonalDotMaxExclusive: Float = 0.70
 
   private let sharpnessProbe = FrameQualityAnalyzer()
   private var keyframeTransforms: [simd_float4x4] = []
@@ -58,8 +75,21 @@ final class KeyframeWriter {
 
   var keyframeCount: Int { entries.count }
 
+  /// True when travel is angled (~45°) relative to look direction and steady.
+  /// Fills the dead band between lateral (|dot| ≤ 0.40) and radial (|dot| ≥ 0.70).
+  private func isDiagonalTravelMotion(_ metrics: FrameMetrics) -> Bool {
+    guard metrics.motionBlurRisk <= diagonalBlurMax else { return false }
+    guard metrics.speed >= diagonalSpeedMin else { return false }
+    let absDot = abs(metrics.travelDotForward)
+    return absDot > diagonalDotMinExclusive && absDot < diagonalDotMaxExclusive
+  }
+
+  private func effectiveMinRotationDeg(for metrics: FrameMetrics) -> Float {
+    isDiagonalTravelMotion(metrics) ? diagonalMinRotationDeg : minRotationDeg
+  }
+
   /// True when `candidate` is too close (pose) to any already-saved keyframe.
-  private func isTooSimilar(to candidate: simd_float4x4) -> Bool {
+  private func isTooSimilar(to candidate: simd_float4x4, minRotationDeg rotationGate: Float) -> Bool {
     let camPos = simd_float3(candidate.columns.3.x, candidate.columns.3.y, candidate.columns.3.z)
     let camQuat = simd_quatf(candidate)
     for existing in keyframeTransforms {
@@ -68,7 +98,7 @@ final class KeyframeWriter {
       if translation < minTranslation {
         let dq = camQuat * simd_quatf(existing).inverse
         let rotationDeg = abs(dq.angle) * 180 / .pi
-        if rotationDeg < minRotationDeg {
+        if rotationDeg < rotationGate {
           return true
         }
       }
@@ -88,7 +118,8 @@ final class KeyframeWriter {
     guard now - lastCaptureTime >= minCaptureInterval else { return }
 
     let transform = frame.camera.transform
-    if !keyframeTransforms.isEmpty, isTooSimilar(to: transform) {
+    let rotationGate = effectiveMinRotationDeg(for: metrics)
+    if !keyframeTransforms.isEmpty, isTooSimilar(to: transform, minRotationDeg: rotationGate) {
       return
     }
 
