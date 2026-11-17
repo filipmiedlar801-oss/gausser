@@ -15,7 +15,8 @@ final class KeyframeWriter {
   // Pose spacing: 0.14 m is ~2× denser than the old 0.28 m gate and still above
   // Apple Spatial Capture’s ~0.08 m default — enough overlap for room-scale 3DGS
   // without flooding near-duplicates. Blur/speed gates stay strict so density
-  // does not come from smear.
+  // does not come from smear. Slight look-down (Polycam Pass 1 floor-aim) gets a
+  // shorter interval so denser pose spacing can fire at walk speed.
   private let minTranslation: Float = 0.14      // m
   private let minRotationDeg: Float = 18
   private let minSharpness01: Float = 0.38
@@ -24,6 +25,22 @@ final class KeyframeWriter {
   private let maxSpeed: Float = 0.45            // m/s
   private let maxAngularSpeed: Float = 28       // deg/s
   private let minCaptureInterval: TimeInterval = 0.9
+  /// Slight look-down cadence densify — Polycam Pass 1 / floor–wall guidance aims
+  /// a few degrees toward the floor. At 0.15–0.25 m/s a flat 0.9 s already covers
+  /// 0.14–0.23 m and blocks open #50’s 0.10 m floor from binding. 0.65 s (~1.5 Hz)
+  /// matches 3DGS guides’ ~1–3 keyframes/s band without loosening blur gates.
+  /// Open junction drafts densify only when `|lookUp| > 0.18` (~10°+); this band
+  /// covers the shallower ~3–10° Pass 1 tilt.
+  private let slightLookDownMinCaptureInterval: TimeInterval = 0.65
+  /// Preview blur floor shared with `isSharpEnough` steady path — densify only
+  /// when the frame is already a steady keep, not by tolerating smear.
+  private let slightLookDownBlurMax: Float = 0.22
+  /// Require real translation so standing pitch alone does not densify
+  /// (LighthouseGS narrow-baseline caution).
+  private let slightLookDownSpeedMin: Float = 0.06  // m/s
+  /// lookUp = camera-forward · worldUp. Exclusive of junction `|lookUp| > 0.18`.
+  private let slightLookDownLookUpMin: Float = -0.18
+  private let slightLookDownLookUpMax: Float = -0.05
 
   private let sharpnessProbe = FrameQualityAnalyzer()
   private var keyframeTransforms: [simd_float4x4] = []
@@ -58,6 +75,24 @@ final class KeyframeWriter {
 
   var keyframeCount: Int { entries.count }
 
+  /// Camera-forward · worldUp (same signal as GuidanceEngine.lookUp).
+  private func lookUp(of candidate: simd_float4x4) -> Float {
+    let forward = -simd_float3(candidate.columns.2.x, candidate.columns.2.y, candidate.columns.2.z)
+    return forward.y
+  }
+
+  /// True when the user is walking with a shallow floor-aim tilt (Polycam Pass 1).
+  private func isSlightLookDownMotion(_ metrics: FrameMetrics, transform: simd_float4x4) -> Bool {
+    guard metrics.motionBlurRisk <= slightLookDownBlurMax else { return false }
+    guard metrics.speed >= slightLookDownSpeedMin else { return false }
+    let tilt = lookUp(of: transform)
+    return tilt > slightLookDownLookUpMin && tilt <= slightLookDownLookUpMax
+  }
+
+  private func effectiveMinCaptureInterval(for metrics: FrameMetrics, transform: simd_float4x4) -> TimeInterval {
+    isSlightLookDownMotion(metrics, transform: transform) ? slightLookDownMinCaptureInterval : minCaptureInterval
+  }
+
   /// True when `candidate` is too close (pose) to any already-saved keyframe.
   private func isTooSimilar(to candidate: simd_float4x4) -> Bool {
     let camPos = simd_float3(candidate.columns.3.x, candidate.columns.3.y, candidate.columns.3.z)
@@ -85,9 +120,9 @@ final class KeyframeWriter {
     guard !captureInFlight else { return }
 
     let now = CACurrentMediaTime()
-    guard now - lastCaptureTime >= minCaptureInterval else { return }
-
     let transform = frame.camera.transform
+    guard now - lastCaptureTime >= effectiveMinCaptureInterval(for: metrics, transform: transform) else { return }
+
     if !keyframeTransforms.isEmpty, isTooSimilar(to: transform) {
       return
     }
