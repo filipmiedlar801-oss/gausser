@@ -15,15 +15,31 @@ final class KeyframeWriter {
   // Pose spacing: 0.14 m is ~2× denser than the old 0.28 m gate and still above
   // Apple Spatial Capture’s ~0.08 m default — enough overlap for room-scale 3DGS
   // without flooding near-duplicates. Blur/speed gates stay strict so density
-  // does not come from smear.
+  // does not come from smear. Slight look-down (Polycam Pass 1 floor-aim) densifies
+  // rotation when already translating steadily — completes the triad with open
+  // translation (#50) and interval (#51).
   private let minTranslation: Float = 0.14      // m
   private let minRotationDeg: Float = 18
+  /// Slight look-down pivots — Polycam Pass 1 / floor–wall guidance aims a few
+  /// degrees toward the floor while walking + gentle yaw. 12° stays above Apple
+  /// Spatial Capture (~10°) and matches open radial / short-exposure / diagonal
+  /// rotation drafts. Completes the slight-look-down triad with open #50/#51.
+  private let slightLookDownMinRotationDeg: Float = 12
   private let minSharpness01: Float = 0.38
   private let minSharpnessRaw: Float = 45
   private let maxMotionBlurRisk: Float = 0.38
   private let maxSpeed: Float = 0.45            // m/s
   private let maxAngularSpeed: Float = 28       // deg/s
   private let minCaptureInterval: TimeInterval = 0.9
+  /// Preview blur floor shared with `isSharpEnough` steady path — densify only
+  /// when the frame is already a steady keep, not by tolerating smear.
+  private let slightLookDownBlurMax: Float = 0.22
+  /// Require real translation so standing pitch / spin alone does not densify
+  /// (LighthouseGS narrow-baseline caution).
+  private let slightLookDownSpeedMin: Float = 0.06  // m/s
+  /// lookUp = camera-forward · worldUp. Exclusive of junction `|lookUp| > 0.18`.
+  private let slightLookDownLookUpMin: Float = -0.18
+  private let slightLookDownLookUpMax: Float = -0.05
 
   private let sharpnessProbe = FrameQualityAnalyzer()
   private var keyframeTransforms: [simd_float4x4] = []
@@ -58,8 +74,29 @@ final class KeyframeWriter {
 
   var keyframeCount: Int { entries.count }
 
+  /// Camera-forward · worldUp (same signal as GuidanceEngine.lookUp).
+  private func lookUp(of candidate: simd_float4x4) -> Float {
+    let forward = -simd_float3(candidate.columns.2.x, candidate.columns.2.y, candidate.columns.2.z)
+    return forward.y
+  }
+
+  /// True when the user is walking with a shallow floor-aim tilt (Polycam Pass 1).
+  private func isSlightLookDownMotion(_ metrics: FrameMetrics, transform: simd_float4x4) -> Bool {
+    guard metrics.motionBlurRisk <= slightLookDownBlurMax else { return false }
+    guard metrics.speed >= slightLookDownSpeedMin else { return false }
+    let tilt = lookUp(of: transform)
+    return tilt > slightLookDownLookUpMin && tilt <= slightLookDownLookUpMax
+  }
+
+  /// Pose rotation floor: milder only while slightly looking down, blur is low,
+  /// and the camera is translating. Default stays 18°; translation/interval/blur/
+  /// speed/sharpness gates unchanged on this change.
+  private func effectiveMinRotationDeg(for metrics: FrameMetrics, transform: simd_float4x4) -> Float {
+    isSlightLookDownMotion(metrics, transform: transform) ? slightLookDownMinRotationDeg : minRotationDeg
+  }
+
   /// True when `candidate` is too close (pose) to any already-saved keyframe.
-  private func isTooSimilar(to candidate: simd_float4x4) -> Bool {
+  private func isTooSimilar(to candidate: simd_float4x4, minRotationDeg rotationGate: Float) -> Bool {
     let camPos = simd_float3(candidate.columns.3.x, candidate.columns.3.y, candidate.columns.3.z)
     let camQuat = simd_quatf(candidate)
     for existing in keyframeTransforms {
@@ -68,7 +105,7 @@ final class KeyframeWriter {
       if translation < minTranslation {
         let dq = camQuat * simd_quatf(existing).inverse
         let rotationDeg = abs(dq.angle) * 180 / .pi
-        if rotationDeg < minRotationDeg {
+        if rotationDeg < rotationGate {
           return true
         }
       }
@@ -88,7 +125,8 @@ final class KeyframeWriter {
     guard now - lastCaptureTime >= minCaptureInterval else { return }
 
     let transform = frame.camera.transform
-    if !keyframeTransforms.isEmpty, isTooSimilar(to: transform) {
+    let rotationGate = effectiveMinRotationDeg(for: metrics, transform: transform)
+    if !keyframeTransforms.isEmpty, isTooSimilar(to: transform, minRotationDeg: rotationGate) {
       return
     }
 
