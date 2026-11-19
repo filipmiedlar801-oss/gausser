@@ -17,6 +17,11 @@ final class KeyframeWriter {
   // without flooding near-duplicates. Blur/speed gates stay strict so density
   // does not come from smear.
   private let minTranslation: Float = 0.14      // m
+  /// Slight look-up densify — XGRIDS / Scaniverse overview passes tilt a few
+  /// degrees toward the ceiling for upper walls, soffits, and fixtures.
+  /// Open junction drafts densify only when `|lookUp| > 0.18` (~10°+); this
+  /// band covers the shallower ~3–10° upward tilt before a dedicated ceiling pass.
+  private let slightLookUpMinTranslation: Float = 0.10
   private let minRotationDeg: Float = 18
   private let minSharpness01: Float = 0.38
   private let minSharpnessRaw: Float = 45
@@ -24,6 +29,16 @@ final class KeyframeWriter {
   private let maxSpeed: Float = 0.45            // m/s
   private let maxAngularSpeed: Float = 28       // deg/s
   private let minCaptureInterval: TimeInterval = 0.9
+  /// Preview blur floor shared with `isSharpEnough` steady path — densify only
+  /// when the frame is already a steady keep, not by tolerating smear.
+  private let slightLookUpBlurMax: Float = 0.22
+  /// Require real translation so standing pitch alone does not densify
+  /// (LighthouseGS narrow-baseline caution).
+  private let slightLookUpSpeedMin: Float = 0.06  // m/s
+  /// lookUp = camera-forward · worldUp. Exclusive of junction `|lookUp| > 0.18`
+  /// and of the slight look-down band (negative tilt).
+  private let slightLookUpLookUpMin: Float = 0.05
+  private let slightLookUpLookUpMax: Float = 0.18
 
   private let sharpnessProbe = FrameQualityAnalyzer()
   private var keyframeTransforms: [simd_float4x4] = []
@@ -58,14 +73,32 @@ final class KeyframeWriter {
 
   var keyframeCount: Int { entries.count }
 
+  /// Camera-forward · worldUp (same signal as GuidanceEngine.lookUp).
+  private func lookUp(of candidate: simd_float4x4) -> Float {
+    let forward = -simd_float3(candidate.columns.2.x, candidate.columns.2.y, candidate.columns.2.z)
+    return forward.y
+  }
+
+  /// True when the user is walking with a shallow ceiling-aim tilt (overview up pass).
+  private func isSlightLookUpMotion(_ metrics: FrameMetrics, transform: simd_float4x4) -> Bool {
+    guard metrics.motionBlurRisk <= slightLookUpBlurMax else { return false }
+    guard metrics.speed >= slightLookUpSpeedMin else { return false }
+    let tilt = lookUp(of: transform)
+    return tilt >= slightLookUpLookUpMin && tilt < slightLookUpLookUpMax
+  }
+
+  private func effectiveMinTranslation(for metrics: FrameMetrics, transform: simd_float4x4) -> Float {
+    isSlightLookUpMotion(metrics, transform: transform) ? slightLookUpMinTranslation : minTranslation
+  }
+
   /// True when `candidate` is too close (pose) to any already-saved keyframe.
-  private func isTooSimilar(to candidate: simd_float4x4) -> Bool {
+  private func isTooSimilar(to candidate: simd_float4x4, minTranslation translationFloor: Float) -> Bool {
     let camPos = simd_float3(candidate.columns.3.x, candidate.columns.3.y, candidate.columns.3.z)
     let camQuat = simd_quatf(candidate)
     for existing in keyframeTransforms {
       let ep = simd_float3(existing.columns.3.x, existing.columns.3.y, existing.columns.3.z)
       let translation = simd_length(camPos - ep)
-      if translation < minTranslation {
+      if translation < translationFloor {
         let dq = camQuat * simd_quatf(existing).inverse
         let rotationDeg = abs(dq.angle) * 180 / .pi
         if rotationDeg < minRotationDeg {
@@ -88,7 +121,8 @@ final class KeyframeWriter {
     guard now - lastCaptureTime >= minCaptureInterval else { return }
 
     let transform = frame.camera.transform
-    if !keyframeTransforms.isEmpty, isTooSimilar(to: transform) {
+    let translationFloor = effectiveMinTranslation(for: metrics, transform: transform)
+    if !keyframeTransforms.isEmpty, isTooSimilar(to: transform, minTranslation: translationFloor) {
       return
     }
 
